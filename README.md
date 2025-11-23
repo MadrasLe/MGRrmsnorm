@@ -1,4 +1,16 @@
 # 🚀 Optimized Fused RMSNorm CUDA Kernel
+<div align="center">
+
+[![CUDA](https://img.shields.io/badge/NVIDIA-CUDA-76B900?style=for-the-badge&logo=nvidia&logoColor=white)](https://developer.nvidia.com/cuda-toolkit)
+[![PyTorch](https://img.shields.io/badge/PyTorch-EE4C2C?style=for-the-badge&logo=pytorch&logoColor=white)](https://pytorch.org/)
+[![C++](https://img.shields.io/badge/C++-00599C?style=for-the-badge&logo=c%2B%2B&logoColor=white)](https://isocpp.org/)
+[![Python](https://img.shields.io/badge/Python-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
+
+<!-- Badge Personalizado de Performance -->
+[![Performance](https://img.shields.io/badge/Speedup-+67%25_vs_Native-brightgreen?style=for-the-badge&logo=rocket&logoColor=white)](https://github.com/MadrasLe/MGRrmsnorm)
+[![License](https://img.shields.io/badge/License-MIT-yellow.svg?style=for-the-badge)](https://opensource.org/licenses/MIT)
+
+</div>
 
 
 This repository contains a highly optimized, production-ready CUDA implementation of **RMSNorm (Root Mean Square Normalization)**. It features a custom **Fused Kernel** with efficient **Backward Pass** support, designed to outperform standard PyTorch implementations and rival industry-standard kernels like Liger.
