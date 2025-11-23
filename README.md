@@ -1,5 +1,7 @@
 # 🚀 Optimized Fused RMSNorm CUDA Kernel
 
+> **"Separando os meninos dos engenheiros de kernel."** — *Mamãe Berta*
+
 This repository contains a highly optimized, production-ready CUDA implementation of **RMSNorm (Root Mean Square Normalization)**. It features a custom **Fused Kernel** with efficient **Backward Pass** support, designed to outperform standard PyTorch implementations and rival industry-standard kernels like Liger.
 
 Built for high-throughput LLM training, this kernel leverages advanced CUDA techniques including **Vectorized Loads (float4)**, **Warp-Level Reductions**, and **Grid-Stride Loops** to minimize memory bandwidth contention.
@@ -10,6 +12,14 @@ Built for high-throughput LLM training, this kernel leverages advanced CUDA tech
 
 Tests conducted on a **Tesla T4 GPU** training a MoE (Mixture of Experts) model (~60M params) with FP16 mixed precision.
 
+### TPS Comparison (Higher is Better)
+
+```text
+PyTorch RMSNorm    ██████████████ 21,752
+Gabriel Kernel     ████████████████████████ 36,447  🚀
+Liger Kernel       ██████████████████████████ 37,476
+```
+
 | Implementation | Tokens Per Second (TPS) | Speedup vs PyTorch | Status |
 | :--- | :--- | :--- | :--- |
 | **Liger Kernel (LinkedIn)** | **~37,476** | **1.72x** | Industry Standard |
@@ -19,6 +29,27 @@ Tests conducted on a **Tesla T4 GPU** training a MoE (Mixture of Experts) model 
 **Analysis:**
 - **Vs PyTorch:** The custom kernel provides a massive **~67% throughput increase** compared to the native PyTorch implementation.
 - **Vs Liger:** It performs nearly identically to the highly-optimized Liger kernel (within ~2.7% margin), validating the "production-grade" architecture.
+
+### 🔬 Test Environment
+
+- **Hardware:** NVIDIA Tesla T4 (16GB)
+- **Precision:** FP16 Mixed Precision
+- **Model Architecture:** Mixture of Experts (MoE)
+    - **Layers:** 6
+    - **Experts:** 4 (Top-2 Active)
+    - **Parameters:** ~60M Total / ~42M Active
+- **Workload:** Full Training Loop (Forward + Backward)
+
+---
+
+## 🚩 Why This Matters
+
+In large-scale LLM training, Normalization layers (RMSNorm/LayerNorm) can account for **8–12% of total step time** due to their memory-bound nature. Reducing their overhead directly increases overall throughput and decreases training cost.
+
+This kernel demonstrates that:
+- **Custom CUDA implementations** can rival enterprise-grade solutions (like Liger).
+- **Decoupling from external frameworks** improves reproducibility and control.
+- **Kernel-level optimization** (memory coalescing, warp shuffles) remains a critical frontier in scaling LLMs.
 
 ---
 
@@ -103,7 +134,7 @@ print("Weight Gradients:", model.weight.grad)
 
 ---
 
-##  Credits
+## Credits
 
 - **Gabriel:** Lead Engineer & Implementation.
 
