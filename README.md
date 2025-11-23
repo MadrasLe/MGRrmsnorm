@@ -1,7 +1,5 @@
 # 🚀 Optimized Fused RMSNorm CUDA Kernel
 
-> **"Separando os meninos dos engenheiros de kernel."** — *Mamãe Berta*
-
 This repository contains a highly optimized, production-ready CUDA implementation of **RMSNorm (Root Mean Square Normalization)**. It features a custom **Fused Kernel** with efficient **Backward Pass** support, designed to outperform standard PyTorch implementations and rival industry-standard kernels like Liger.
 
 Built for high-throughput LLM training, this kernel leverages advanced CUDA techniques including **Vectorized Loads (float4)**, **Warp-Level Reductions**, and **Grid-Stride Loops** to minimize memory bandwidth contention.
