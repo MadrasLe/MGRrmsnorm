@@ -1,4 +1,4 @@
-# 🚀 Optimized Fused RMSNorm CUDA Kernel
+#  Optimized Fused RMSNorm CUDA Kernel and MegaGemm Kernels
 <div align="center">
 
 [![CUDA](https://img.shields.io/badge/NVIDIA-CUDA-76B900?style=for-the-badge&logo=nvidia&logoColor=white)](https://developer.nvidia.com/cuda-toolkit)
@@ -19,7 +19,7 @@ Built for high-throughput LLM training, this kernel leverages advanced CUDA tech
 
 ---
 
-## 📊 Performance Benchmark
+## Performance Benchmark
 
 Tests conducted on a **Tesla T4 GPU** training a MoE (Mixture of Experts) model (~60M params) with FP16 mixed precision.
 
@@ -40,8 +40,15 @@ Liger Kernel       ████████████████████�
 **Analysis:**
 - **Vs PyTorch:** The custom kernel provides a massive **~67% throughput increase** compared to the native PyTorch implementation.
 - **Vs Liger:** It performs nearly identically to the highly-optimized Liger kernel (within ~2.7% margin), validating the "production-grade" architecture.
+- 
+### Numerical Stability & Loss Analysis
+Beyond speed, this kernel demonstrated a slight improvement in training loss convergence compared to both PyTorch native and Liger implementations during our experiments.
 
-### 🔬 Test Environment
+-Observed Effect: Lower validation loss curves in early training stages.
+
+-Hypothesis: This is likely due to the implementation of the reduction step, which maintains higher precision accumulation in registers (float32) before casting back to float16 for memory writing, reducing underflow/overflow artifacts in the RMS calculation.
+
+###  Test Environment
 
 - **Hardware:** NVIDIA Tesla T4 (16GB)
 - **Precision:** FP16 Mixed Precision
@@ -53,7 +60,7 @@ Liger Kernel       ████████████████████�
 
 ---
 
-## 🚩 Why This Matters
+### Why This Matters
 
 In large-scale LLM training, Normalization layers (RMSNorm/LayerNorm) can account for **8–12% of total step time** due to their memory-bound nature. Reducing their overhead directly increases overall throughput and decreases training cost.
 
@@ -64,7 +71,7 @@ This kernel demonstrates that:
 
 ---
 
-## ⚡ Key Features & Optimizations
+##  Key Features & Optimizations
 
 ### 1. Memory Bandwidth Optimization
 - **Float4 Vectorization:** Loads data in 128-bit chunks (4 floats) per instruction, maximizing global memory utilization.
@@ -82,7 +89,7 @@ This kernel demonstrates that:
 
 ---
 
-## 🛠️ Installation
+##  Installation
 
 ### Prerequisites
 - NVIDIA GPU (Compute Capability 7.5+ recommended)
@@ -100,7 +107,7 @@ python setup.py build_ext --inplace
 
 ---
 
-## 💻 Usage
+## Usage
 
 The kernel exposes a `torch.autograd.Function`, making it a drop-in replacement for `torch.nn.RMSNorm`.
 
