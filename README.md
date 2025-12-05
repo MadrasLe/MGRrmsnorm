@@ -34,7 +34,7 @@ Liger Kernel       ████████████████████�
 | Implementation | Tokens Per Second (TPS) | Speedup vs PyTorch | Status |
 | :--- | :--- | :--- | :--- |
 | **Liger Kernel (LinkedIn)** | **~37,476** | **1.72x** | Industry Standard |
-| **Gabriel's Fused Kernel** | **~36,447** | **1.67x** | **This Repo** 🚀 |
+| **MegaGemm Fused Kernel** | **~36,447** | **1.67x** | **This Repo** 🚀 |
 | **PyTorch Baseline** | ~21,752 | 1.0x | Baseline |
 
 **Analysis:**
