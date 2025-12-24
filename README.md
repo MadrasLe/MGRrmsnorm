@@ -1,158 +1,181 @@
-#  Optimized Fused RMSNorm CUDA Kernel and MegaGemm Kernels
+# 🔥 MegaGemm - High Performance CUDA Kernels for LLMs
+
 <div align="center">
 
 [![CUDA](https://img.shields.io/badge/NVIDIA-CUDA-76B900?style=for-the-badge&logo=nvidia&logoColor=white)](https://developer.nvidia.com/cuda-toolkit)
 [![PyTorch](https://img.shields.io/badge/PyTorch-EE4C2C?style=for-the-badge&logo=pytorch&logoColor=white)](https://pytorch.org/)
-[![C++](https://img.shields.io/badge/C++-00599C?style=for-the-badge&logo=c%2B%2B&logoColor=white)](https://isocpp.org/)
+[![Triton](https://img.shields.io/badge/Triton-6C4DC4?style=for-the-badge&logo=openai&logoColor=white)](https://triton-lang.org/)
 [![Python](https://img.shields.io/badge/Python-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
 
-<!-- Badge Personalizado de Performance -->
-[![Performance](https://img.shields.io/badge/Speedup-+67%25_vs_Native-brightgreen?style=for-the-badge&logo=rocket&logoColor=white)](https://github.com/MadrasLe/MGRrmsnorm)
+[![Performance](https://img.shields.io/badge/Speedup-3x_vs_Native-brightgreen?style=for-the-badge&logo=rocket&logoColor=white)](https://github.com/MadrasLe/MGRrmsnorm)
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg?style=for-the-badge)](https://opensource.org/licenses/MIT)
 
 </div>
 
+Production-ready **RMSNorm** and **SwiGLU** kernels optimized for LLM training and inference. Drop-in replacements for PyTorch with **up to 3x speedup**.
 
-This repository contains a highly optimized, production-ready CUDA implementation of **RMSNorm (Root Mean Square Normalization)**. It features a custom **Fused Kernel** with efficient **Backward Pass** support, designed to outperform standard PyTorch implementations and rival industry-standard kernels like Liger.
+## ✨ Features
 
-Built for high-throughput LLM training, this kernel leverages advanced CUDA techniques including **Vectorized Loads (float4)**, **Warp-Level Reductions**, and **Grid-Stride Loops** to minimize memory bandwidth contention.
-
----
-
-## Performance Benchmark
-
-Tests conducted on a **Tesla T4 GPU** training a MoE (Mixture of Experts) model (~60M params) with FP16 mixed precision.
-
-### TPS Comparison (Higher is Better)
-
-```text
-PyTorch RMSNorm    ██████████████ 21,752
-Gabriel Kernel     ████████████████████████ 36,447  🚀
-Liger Kernel       ██████████████████████████ 37,476
-```
-
-| Implementation | Tokens Per Second (TPS) | Speedup vs PyTorch | Status |
-| :--- | :--- | :--- | :--- |
-| **Liger Kernel (LinkedIn)** | **~37,476** | **1.72x** | Industry Standard |
-| **MegaGemm Fused Kernel** | **~36,447** | **1.67x** | **This Repo** 🚀 |
-| **PyTorch Baseline** | ~21,752 | 1.0x | Baseline |
-
-**Analysis:**
-- **Vs PyTorch:** The custom kernel provides a massive **~67% throughput increase** compared to the native PyTorch implementation.
-- **Vs Liger:** It performs nearly identically to the highly-optimized Liger kernel (within ~2.7% margin), validating the "production-grade" architecture.
-- 
-### Numerical Stability & Loss Analysis
-Beyond speed, this kernel demonstrated a slight improvement in training loss convergence compared to both PyTorch native and Liger implementations during our experiments.
-
--Observed Effect: Lower validation loss curves in early training stages.
-
--Hypothesis: This is likely due to the implementation of the reduction step, which maintains higher precision accumulation in registers (float32) before casting back to float16 for memory writing, reducing underflow/overflow artifacts in the RMS calculation.
-
-###  Test Environment
-
-- **Hardware:** NVIDIA Tesla T4 (16GB)
-- **Precision:** FP16 Mixed Precision
-- **Model Architecture:** Mixture of Experts (MoE)
-    - **Layers:** 6
-    - **Experts:** 4 (Top-2 Active)
-    - **Parameters:** ~60M Total / ~42M Active
-- **Workload:** Full Training Loop (Forward + Backward)
+- 🚀 **RMSNorm CUDA Kernel** - FP32, FP16, BF16 support with vectorized loads
+- ⚡ **SwiGLU Triton Kernel** - Fused activation with memory-efficient design  
+- 🔄 **Full Autograd Support** - Forward and backward passes
+- 📦 **pip installable** - `pip install -e .`
 
 ---
 
-### Why This Matters
+## 📊 Performance Benchmarks
 
-In large-scale LLM training, Normalization layers (RMSNorm/LayerNorm) can account for **8–12% of total step time** due to their memory-bound nature. Reducing their overhead directly increases overall throughput and decreases training cost.
+### RMSNorm Performance
 
-This kernel demonstrates that:
-- **Custom CUDA implementations** can rival enterprise-grade solutions (like Liger).
-- **Decoupling from external frameworks** improves reproducibility and control.
-- **Kernel-level optimization** (memory coalescing, warp shuffles) remains a critical frontier in scaling LLMs.
+| GPU | Architecture | PyTorch | MegaGemm | Speedup |
+|-----|-------------|---------|----------|---------|
+| **NVIDIA L4** | Ada Lovelace | 0.818 ms | 0.270 ms | **3.03x** 🔥 |
+| **Tesla T4** | Turing | 21,752 TPS | 36,447 TPS | **1.67x** |
+
+> Tested with: batch=32, seq=128, hidden=4096, dtype=float16
+
+### SwiGLU Performance
+
+| GPU | PyTorch | MegaGemm | Notes |
+|-----|---------|----------|-------|
+| **NVIDIA L4** | 58.78 ms | 56.64 ms | Memory-efficient (matmul-bound) |
+
+> The SwiGLU kernel's main benefit is **memory efficiency** through fused W1+W2 matmul, not raw compute speed.
+
+### Why RMSNorm is 3x Faster
+
+RMSNorm is **memory-bound**, making it ideal for optimization:
+- **half2 Vectorization** - 64-bit loads for FP16
+- **float4 Vectorization** - 128-bit loads for FP32  
+- **Warp Shuffles** - Fast reduction without shared memory
+- **FP32 Accumulators** - Numerical stability in mixed precision
 
 ---
 
-##  Key Features & Optimizations
+## 🚀 Installation
 
-### 1. Memory Bandwidth Optimization
-- **Float4 Vectorization:** Loads data in 128-bit chunks (4 floats) per instruction, maximizing global memory utilization.
-- **Strict Alignment Checks:** Enforces 16-byte memory alignment to prevent segmentation faults and ensure safe vectorization.
-
-### 2. Compute Efficiency
-- **Warp Reduction:** Uses `__shfl_down_sync` primitive for ultra-fast intra-warp summation, avoiding slower shared memory for the initial reduction stage.
-- **Fused Operation:** Performs root-mean-square calculation, normalization, and scaling in a single kernel launch, eliminating redundant global memory round-trips.
-- **Fast Math:** Leverages `rsqrtf` and FMA (Fused Multiply-Add) instructions.
-
-### 3. Scalable Backward Pass
-- **Grid-Stride Loops:** The Backward kernel uses a grid-stride pattern, decoupling the number of CUDA blocks from the batch size.
-- **Register Accumulation:** Weight gradients (`dw`) are accumulated in local registers (`float4 dw_acc[]`) instead of global memory.
-- **Minimized Atomics:** Global `atomicAdd` operations are performed only **once per thread** (after the loop), reducing contention from $O(N)$ to $O(\text{GridSize})$.
-
----
-
-##  Installation
-
-### Prerequisites
-- NVIDIA GPU (Compute Capability 7.5+ recommended)
-- CUDA Toolkit
-- PyTorch
-
-### Build from Source
 ```bash
-# Install explicitly
-python setup.py install
+# Clone
+git clone https://github.com/MadrasLe/MGRrmsnorm.git
+cd MGRrmsnorm
 
-# Or build in-place
-python setup.py build_ext --inplace
+# Install
+pip install triton
+pip install -e .
 ```
+
+### Requirements
+- NVIDIA GPU (Compute Capability 7.5+)
+- CUDA Toolkit 11.8+
+- PyTorch 2.0+
+- Triton 2.0+
 
 ---
 
-## Usage
+## 📖 Usage
 
-The kernel exposes a `torch.autograd.Function`, making it a drop-in replacement for `torch.nn.RMSNorm`.
+### RMSNorm (CUDA)
 
 ```python
+from megagemm import RMSNorm
 import torch
-import torch.nn as nn
-from rmsnorm_cuda import RMSNorm  # Assuming installed as package or local import
 
-# Initialize
-device = torch.device("cuda")
-hidden_size = 4096
-model = RMSNorm(hidden_size).to(device)
-
-# Forward
-x = torch.randn(32, 128, hidden_size, device=device, requires_grad=True)
+# FP16
+model = RMSNorm(4096).cuda().half()
+x = torch.randn(32, 128, 4096, device='cuda', dtype=torch.float16)
 y = model(x)
 
-# Backward (Fully supported)
+# BF16 (Ampere+ GPUs)
+model_bf16 = RMSNorm(4096).cuda().to(torch.bfloat16)
+y = model_bf16(x.to(torch.bfloat16))
+
+# Backward pass fully supported
 loss = y.sum()
 loss.backward()
+```
 
-print("Input Gradients:", x.grad)
-print("Weight Gradients:", model.weight.grad)
+### SwiGLU (Triton)
+
+```python
+from megagemm import MegaGemmTriton
+import torch
+
+model = MegaGemmTriton(d_model=4096).cuda().half()
+x = torch.randn(32, 128, 4096, device='cuda', dtype=torch.float16)
+y = model(x)  # [32, 128, 4096]
 ```
 
 ---
 
-## 🧠 Technical Architecture
+## 🧠 Technical Details
 
-### Forward Pass
-1. **Load:** Threads read input $x$ using `float4`.
-2. **Reduce:** Compute $\sum x^2$ via warp shuffle + shared memory reduction.
-3. **Scale:** Thread 0 computes $s = \frac{1}{\sqrt{\text{mean} + \epsilon}}$.
-4. **Write:** All threads write $y = x \cdot s \cdot w$.
-5. **Context:** Saves $s$ (inverse RMS) for the backward pass.
+### RMSNorm Kernel Architecture
 
-### Backward Pass
-1. **Grid-Stride:** A fixed grid (e.g., 128 blocks) iterates over rows.
-2. **Compute $dx$:** Uses the saved $s$ to compute input gradients efficiently.
-3. **Accumulate $dw$:** Accumulates weight gradients in registers to avoid atomic contention.
-4. **Finalize:** Atomically adds register values to the global weight gradient buffer.
+**Forward Pass:**
+1. Load input with `float4`/`half2` vectorization
+2. Compute Σx² via warp shuffle reduction
+3. Calculate inverse RMS: `s = rsqrt(mean + ε)`
+4. Write normalized output: `y = x * s * w`
+
+**Backward Pass:**
+1. Grid-stride loop over rows
+2. Register accumulation for weight gradients
+3. Single atomic add per thread (minimized contention)
+
+### SwiGLU Kernel Architecture
+
+- Fused W1+W2 into single matmul for memory efficiency
+- Triton kernel for SiLU(gate) × value activation
+- No intermediate tensor allocation
 
 ---
 
-## Credits
+## 📁 Project Structure
 
-- **Gabriel:** Lead Engineer & Implementation.
+```
+MGRrmsnorm/
+├── megagemm/              # Python package
+│   ├── __init__.py
+│   ├── rmsnorm.py         # RMSNorm module
+│   └── swiglu.py          # SwiGLU Triton module
+├── src/
+│   ├── rmsnorm_kernel.cu  # CUDA kernels (FP32/FP16/BF16)
+│   └── rmsnorm_kernel.h   # Header declarations
+├── pytorch_binding/
+│   └── binding.cpp        # PyTorch C++ bindings
+├── benchmark_swiglu.py    # Benchmark script
+├── setup.py
+└── pyproject.toml
+```
 
+---
+
+## 🔬 Numerical Stability
+
+The kernel maintains **FP32 accumulators** during reduction, even for FP16/BF16 inputs. This prevents underflow/overflow in the RMS calculation and has been observed to produce slightly better training loss curves compared to naive implementations.
+
+---
+
+## 📝 Citation
+
+```bibtex
+@software{megagemm2024,
+  author = {Gabriel Yogi},
+  title = {MegaGemm: High Performance CUDA Kernels for LLMs},
+  year = {2024},
+  url = {https://github.com/MadrasLe/MGRrmsnorm}
+}
+```
+
+---
+
+## 📄 License
+
+MIT License - see [LICENSE](LICENSE) for details.
+
+---
+
+## 🙏 Acknowledgments
+
+- **Gabriel Yogi** - Lead Engineer & Implementation
+- Inspired by [Liger Kernel](https://github.com/linkedin/Liger-Kernel) architecture

@@ -1,17 +1,7 @@
 #pragma once
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
-
-// Check for BF16 support (Ampere+)
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-#define MG_BF16_SUPPORTED 1
 #include <cuda_bf16.h>
-#else
-#define MG_BF16_SUPPORTED 0
-#endif
-
-// Dtype enum for dispatch
-enum class RMSNormDtype { FP32, FP16, BF16 };
 
 // =============================================================================
 // FP32 API (Original)
@@ -56,10 +46,8 @@ bool rmsnorm_backward_cuda_fp16(
 );
 
 // =============================================================================
-// BF16 API (Ampere+ only)
+// BF16 API
 // =============================================================================
-#if MG_BF16_SUPPORTED || defined(__CUDACC__)
-// Forward declaration - will compile on all systems but only work on Ampere+
 bool rmsnorm_cuda_bf16(
     __nv_bfloat16* out, 
     float* inv_rms,
@@ -77,9 +65,10 @@ bool rmsnorm_backward_cuda_bf16(
     const float* inv_rms,
     int rows, int cols
 );
-#endif
 
+// =============================================================================
 // Legacy API (backward compatibility) - maps to FP32
+// =============================================================================
 inline bool rmsnorm_cuda(float* out, float* inv_rms, const float* in, const float* weight, int rows, int cols, float epsilon) {
     return rmsnorm_cuda_fp32(out, inv_rms, in, weight, rows, cols, epsilon);
 }

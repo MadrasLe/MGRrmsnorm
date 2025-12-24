@@ -10,8 +10,8 @@ import time
 from typing import Tuple, Dict
 import sys
 
-# Import local module
-from SwigluTriton import MegaGemmTriton
+# Import from megagemm package
+from megagemm import MegaGemmTriton
 
 def benchmark_fn(fn, *args, warmup: int = 10, iterations: int = 100) -> Tuple[float, float]:
     """
