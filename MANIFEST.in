@@ -1,0 +1,7 @@
+include README.md
+include LICENSE
+include pyproject.toml
+
+recursive-include src *.cu *.h *.cpp
+recursive-include pytorch_binding *.cpp
+recursive-include megagemm *.py
