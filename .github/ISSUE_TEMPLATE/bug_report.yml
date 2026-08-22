@@ -1,0 +1,66 @@
+name: Bug report
+description: Report a reproducible correctness, installation, or runtime problem.
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please remove secrets and private model paths from logs before submitting.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What happened, and what did you expect instead?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Include the exact command or smallest Python snippet.
+      render: shell
+    validations:
+      required: true
+  - type: input
+    id: model
+    attributes:
+      label: Model/checkpoint
+      placeholder: Qwen/Qwen2.5-3B-Instruct
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, Python, PyTorch, CUDA/ROCm, Triton, GPU/CPU, and installation command.
+    validations:
+      required: true
+  - type: dropdown
+    id: backend
+    attributes:
+      label: Backend or subsystem
+      options:
+        - GPU inference engine
+        - CPU PyTorch fallback
+        - MicroGemm CPU runtime
+        - MegaMesh
+        - MGX / Prophet
+        - Embeddings
+        - Packaging / installation
+        - Tests / benchmarks
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs and traceback
+      render: text
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I searched existing issues.
+          required: true
+        - label: I removed credentials, tokens, and private paths.
+          required: true

@@ -1,0 +1,13 @@
+build/
+dist/
+__pycache__/
+*.pyc
+*.o
+*.obj
+*.a
+*.lib
+*.dll
+*.so
+*.dylib
+*.exe
+*.mgm

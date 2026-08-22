@@ -1,0 +1,50 @@
+{
+  "captures": [
+    {
+      "label": "latency-long-base",
+      "prompt": "Explain why compiled model artifacts reduce cold-start latency in GPU serving. Cover TTFT, weight loading, tokenizer startup, CUDA context creation, graph warmup, memory mapping, scheduler readiness, and why avoiding repeated runtime initialization improves startup consistency during autoscaling."
+    },
+    {
+      "label": "batching-long-base",
+      "prompt": "Summarize the main serving benefits of continuous batching for LLM inference. Cover GPU utilization, throughput, queue efficiency, request interleaving, tail latency, mixed prompt lengths, and why admitting work continuously is better than draining static batches."
+    },
+    {
+      "label": "kv-long-base",
+      "prompt": "Explain how paged KV cache reduces memory fragmentation during LLM serving. Cover fixed-size blocks, allocation churn, memory reuse, long-context stability, allocator pressure, and how block-based reuse interacts with continuous batching."
+    }
+  ],
+  "queries": [
+    {
+      "label": "latency-exact-long",
+      "prompt": "Explain why compiled model artifacts reduce cold-start latency in GPU serving. Cover TTFT, weight loading, tokenizer startup, CUDA context creation, graph warmup, memory mapping, scheduler readiness, and why avoiding repeated runtime initialization improves startup consistency during autoscaling."
+    },
+    {
+      "label": "latency-append-short",
+      "prompt": "Explain why compiled model artifacts reduce cold-start latency in GPU serving. Cover TTFT, weight loading, tokenizer startup, CUDA context creation, graph warmup, memory mapping, scheduler readiness, and why avoiding repeated runtime initialization improves startup consistency during autoscaling. Add one practical deployment example."
+    },
+    {
+      "label": "latency-refocus-short",
+      "prompt": "Explain why compiled model artifacts reduce cold-start latency in GPU serving. Cover TTFT, weight loading, tokenizer startup, CUDA context creation, graph warmup, memory mapping, scheduler readiness, and why avoiding repeated runtime initialization improves startup consistency during autoscaling. Focus on pod startup behavior."
+    },
+    {
+      "label": "batching-exact-long",
+      "prompt": "Summarize the main serving benefits of continuous batching for LLM inference. Cover GPU utilization, throughput, queue efficiency, request interleaving, tail latency, mixed prompt lengths, and why admitting work continuously is better than draining static batches."
+    },
+    {
+      "label": "batching-append-short",
+      "prompt": "Summarize the main serving benefits of continuous batching for LLM inference. Cover GPU utilization, throughput, queue efficiency, request interleaving, tail latency, mixed prompt lengths, and why admitting work continuously is better than draining static batches. Add one example involving short and long prompts together."
+    },
+    {
+      "label": "kv-exact-long",
+      "prompt": "Explain how paged KV cache reduces memory fragmentation during LLM serving. Cover fixed-size blocks, allocation churn, memory reuse, long-context stability, allocator pressure, and how block-based reuse interacts with continuous batching."
+    },
+    {
+      "label": "kv-append-short",
+      "prompt": "Explain how paged KV cache reduces memory fragmentation during LLM serving. Cover fixed-size blocks, allocation churn, memory reuse, long-context stability, allocator pressure, and how block-based reuse interacts with continuous batching. Relate it to long-context serving."
+    },
+    {
+      "label": "off-domain-control",
+      "prompt": "Why does sourdough bread taste more acidic than regular bread?"
+    }
+  ]
+}

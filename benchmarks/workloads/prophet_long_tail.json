@@ -1,0 +1,46 @@
+{
+  "captures": [
+    {
+      "label": "latency-core",
+      "prompt": "Explain why compiled model artifacts reduce cold-start latency."
+    },
+    {
+      "label": "batching-core",
+      "prompt": "Summarize the main serving benefits of continuous batching for LLM inference."
+    },
+    {
+      "label": "kv-core",
+      "prompt": "Explain how paged KV cache reduces memory fragmentation during LLM serving."
+    }
+  ],
+  "queries": [
+    {
+      "label": "exact",
+      "prompt": "Explain why compiled model artifacts reduce cold-start latency."
+    },
+    {
+      "label": "prefix-tail-medium",
+      "prompt": "Explain why compiled model artifacts reduce cold-start latency. Focus on TTFT and GPU serving. Cover weight loading, tokenizer startup, CUDA context creation, graph warmup, memory mapping, and give one practical autoscaling deployment example."
+    },
+    {
+      "label": "prefix-tail-long",
+      "prompt": "Explain why compiled model artifacts reduce cold-start latency. Focus on TTFT and GPU serving. Cover weight loading, tokenizer startup, CUDA context creation, graph warmup, memory mapping, and give one practical autoscaling deployment example. Compare precompiled artifacts with loading a raw checkpoint at request time. Mention pod churn, startup jitter, scheduler readiness, and why repeated deserialization hurts cold-start behavior."
+    },
+    {
+      "label": "prefix-tail-xlong",
+      "prompt": "Explain why compiled model artifacts reduce cold-start latency. Focus on TTFT and GPU serving. Cover weight loading, tokenizer startup, CUDA context creation, graph warmup, memory mapping, and give one practical autoscaling deployment example. Compare precompiled artifacts with loading a raw checkpoint at request time. Mention pod churn, startup jitter, scheduler readiness, and why repeated deserialization hurts cold-start behavior. Explain how artifact reuse avoids repeated tensor remapping, shape validation, quantization metadata loading, kernel selection, KV cache planning, and other runtime setup work. End with three operational tips for keeping latency stable during scale-out events."
+    },
+    {
+      "label": "prefix-tail-xxlong",
+      "prompt": "Explain why compiled model artifacts reduce cold-start latency. Focus on TTFT and GPU serving. Cover weight loading, tokenizer startup, CUDA context creation, graph warmup, memory mapping, and give one practical autoscaling deployment example. Compare precompiled artifacts with loading a raw checkpoint at request time. Mention pod churn, startup jitter, scheduler readiness, and why repeated deserialization hurts cold-start behavior. Explain how artifact reuse avoids repeated tensor remapping, shape validation, quantization metadata loading, kernel selection, KV cache planning, and other runtime setup work. Also discuss container cold boot, filesystem reads, safetensors parsing, host to device transfers, health-check deadlines, warm pool design, and graph capture readiness. Include a concrete example involving a bursty inference API, multiple fresh GPU replicas, a strict TTFT SLO, and the difference between prebuilt artifacts and ad hoc initialization. Finish with a short checklist for observability, rollback, and cache invalidation."
+    },
+    {
+      "label": "semantic-nearby-long",
+      "prompt": "Explain how compiled model artifacts help reduce TTFT in GPU serving. Focus on weight loading, runtime startup, graph warmup, scheduler readiness, autoscaling, and deployment stability. Compare artifact-based startup with raw checkpoint loading and describe one real serving scenario."
+    },
+    {
+      "label": "off-domain-long",
+      "prompt": "What makes sourdough bread more acidic than regular bread? Explain the role of fermentation, wild yeast, lactic acid bacteria, flour choice, fermentation time, hydration, and temperature. Give one practical baking example and one way to reduce acidity."
+    }
+  ]
+}

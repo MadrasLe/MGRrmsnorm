@@ -1,0 +1,59 @@
+{
+  "description": "Safe Prophet cache-reuse workload for max_seq_len=4096. Larger 3k-ish repeated context with short tails.",
+  "captures": [
+    {
+      "label": "serving-report-3k-base",
+      "prompt": "You are evaluating a longer GPU serving incident report. Use only the report below. Keep the final answer concise.\n\nREPORT START\n",
+      "prompt_parts": [
+        {
+          "text": "Telemetry row: tenant=atlas, route=/v1/chat, artifact=mgx-int8, tokenizer=qwen, scheduler=continuous, kv_policy=paged, cache_policy=prophet, signal=prefill dominates when repeated context is large and generated answer length stays small.\n",
+          "repeat": 56
+        },
+        "\nREPORT END\nTask: In two short bullets, explain whether Prophet should reduce TTFT for this request."
+      ]
+    }
+  ],
+  "queries": [
+    {
+      "label": "serving-3k-exact",
+      "prompt": "You are evaluating a longer GPU serving incident report. Use only the report below. Keep the final answer concise.\n\nREPORT START\n",
+      "prompt_parts": [
+        {
+          "text": "Telemetry row: tenant=atlas, route=/v1/chat, artifact=mgx-int8, tokenizer=qwen, scheduler=continuous, kv_policy=paged, cache_policy=prophet, signal=prefill dominates when repeated context is large and generated answer length stays small.\n",
+          "repeat": 56
+        },
+        "\nREPORT END\nTask: In two short bullets, explain whether Prophet should reduce TTFT for this request."
+      ]
+    },
+    {
+      "label": "serving-3k-tail-metric",
+      "prompt": "You are evaluating a longer GPU serving incident report. Use only the report below. Keep the final answer concise.\n\nREPORT START\n",
+      "prompt_parts": [
+        {
+          "text": "Telemetry row: tenant=atlas, route=/v1/chat, artifact=mgx-int8, tokenizer=qwen, scheduler=continuous, kv_policy=paged, cache_policy=prophet, signal=prefill dominates when repeated context is large and generated answer length stays small.\n",
+          "repeat": 56
+        },
+        "\nREPORT END\nTask: In two short bullets, explain whether Prophet should reduce TTFT for this request. Name one metric to watch."
+      ]
+    },
+    {
+      "label": "serving-3k-tail-risk",
+      "prompt": "You are evaluating a longer GPU serving incident report. Use only the report below. Keep the final answer concise.\n\nREPORT START\n",
+      "prompt_parts": [
+        {
+          "text": "Telemetry row: tenant=atlas, route=/v1/chat, artifact=mgx-int8, tokenizer=qwen, scheduler=continuous, kv_policy=paged, cache_policy=prophet, signal=prefill dominates when repeated context is large and generated answer length stays small.\n",
+          "repeat": 56
+        },
+        "\nREPORT END\nTask: In two short bullets, explain whether Prophet should reduce TTFT for this request. Add one correctness risk."
+      ]
+    },
+    {
+      "label": "nearby-semantic-control",
+      "prompt": "Explain how an LLM serving runtime can reduce TTFT when many requests share the same long system prompt but ask slightly different final questions."
+    },
+    {
+      "label": "off-domain-control",
+      "prompt": "Why does sourdough bread taste more acidic than regular bread?"
+    }
+  ]
+}

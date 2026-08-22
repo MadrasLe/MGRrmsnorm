@@ -1,0 +1,36 @@
+* text=auto
+.gitattributes text eol=lf
+.gitignore text eol=lf
+
+# Keep source, build, benchmark and documentation files portable across
+# Windows development machines and Linux/CUDA execution environments.
+*.c text eol=lf
+*.cc text eol=lf
+*.cpp text eol=lf
+*.cu text eol=lf
+*.cuh text eol=lf
+*.h text eol=lf
+*.hpp text eol=lf
+*.py text eol=lf
+*.pyi text eol=lf
+*.sh text eol=lf
+Makefile text eol=lf
+
+*.json text eol=lf
+*.md text eol=lf
+*.toml text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+*.gif binary
+*.jpeg binary
+*.jpg binary
+*.pdf binary
+*.png binary
+*.pt binary
+*.safetensors binary
+*.zip binary

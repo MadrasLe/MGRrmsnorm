@@ -1,0 +1,99 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "megagemm"
+version = "0.3.0"
+description = "Experimental LLM inference runtime with custom CUDA, Triton, C++, and CPU kernels"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "Gabriel Yogi"}
+]
+keywords = [
+    "cuda", "pytorch", "triton", "llm", "inference",
+    "rmsnorm", "swiglu", "paged-attention", "quantization",
+    "int8", "awq", "llama", "qwen", "mistral",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: C++",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/MadrasLe/MGRrmsnorm"
+Repository = "https://github.com/MadrasLe/MGRrmsnorm"
+Issues = "https://github.com/MadrasLe/MGRrmsnorm/issues"
+
+[project.scripts]
+megagemm = "megagemm.__main__:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-benchmark",
+]
+inference = [
+    "triton>=2.0",
+    "huggingface_hub",
+    "safetensors",
+    "transformers",
+    "sentencepiece",
+]
+embeddings = [
+    "huggingface_hub",
+    "safetensors",
+    "transformers",
+    "sentencepiece",
+]
+cpu = [
+    "numpy",
+]
+mesh = [
+    "numpy",
+    "safetensors",
+    "transformers",
+]
+monitoring = [
+    "psutil",
+]
+benchmark = [
+    "psutil",
+    "tqdm",
+]
+quantization = [
+    "autoawq",
+]
+performance = [
+    "causal-conv1d",
+    "flash-attn",
+]
+all = [
+    "triton>=2.0",
+    "huggingface_hub",
+    "safetensors",
+    "transformers",
+    "sentencepiece",
+    "numpy",
+    "psutil",
+    "tqdm",
+    "autoawq",
+    "pytest",
+    "pytest-benchmark",
+]
+
+[tool.setuptools.packages.find]
+include = ["megagemm*"]

@@ -1,0 +1,67 @@
+name: Performance report
+description: Submit a benchmark result or performance regression with reproducible metadata.
+title: "[Perf] "
+labels: ["performance"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Performance results without workload and environment metadata cannot be compared reliably.
+  - type: textarea
+    id: result
+    attributes:
+      label: Result summary
+      description: State the metric and whether this is an improvement, regression, or comparison.
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Exact command
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: workload
+    attributes:
+      label: Workload
+      description: Model, dtype/quantization, batch, prompt tokens, output tokens, EOS policy, warmup, repeats, and aggregation.
+    validations:
+      required: true
+  - type: textarea
+    id: hardware
+    attributes:
+      label: Hardware
+      description: GPU/CPU model, count, visible memory, logical/physical CPU count, and thread affinity if relevant.
+    validations:
+      required: true
+  - type: textarea
+    id: software
+    attributes:
+      label: Software versions
+      description: Commit, OS, Python, driver, CUDA/ROCm, PyTorch, Triton, Transformers, and comparison backend.
+    validations:
+      required: true
+  - type: textarea
+    id: metrics
+    attributes:
+      label: Metrics
+      description: TTFT, prefill TPS, decode TPS, end-to-end TPS, memory, and correctness/quality result as applicable.
+    validations:
+      required: true
+  - type: textarea
+    id: artifact
+    attributes:
+      label: Raw artifact
+      description: Link or attach JSON/CSV/log output. State whether both backends ran in the same session.
+  - type: checkboxes
+    id: cache
+    attributes:
+      label: Runtime state
+      options:
+        - label: I stated whether prefix caching or Prophet restore was enabled.
+          required: true
+        - label: I stated whether CUDA Graphs or compilation warmup was included.
+          required: true
+        - label: I ran a correctness or output sanity check before timing.
+          required: true

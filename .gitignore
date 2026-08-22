@@ -1,0 +1,74 @@
+# Python caches and test state
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python/native build products
+build/
+dist/
+*.egg-info/
+*.so
+*.pyd
+*.dylib
+*.dll
+*.o
+*.obj
+*.lib
+*.exp
+
+# Local native output
+microgemm/out/
+
+# Models and generated runtime artifacts
+*.safetensors
+*.gguf
+*.mgx
+*.onnx
+*.pt
+*.pth
+*.ckpt
+artifacts/
+
+# Generated benchmark output. Keep the curated Markdown notes.
+bench_results/*
+!bench_results/notes/
+!bench_results/notes/*.md
+bench_resultsqwen_typo_check/
+
+# Temporary test artifacts
+tmp_*/
+megamesh_*_test_*/
+_patch_attn.py
+
+# Logs and extracted local research material
+*.log
+log*.txt
+2505.17331v2-_1_.txt
+
+# Local agent/editor state
+.agent/
+.agents/
+.claude/
+.idea/
+.vscode/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# OS metadata
+.DS_Store
+Thumbs.db
+Desktop.ini

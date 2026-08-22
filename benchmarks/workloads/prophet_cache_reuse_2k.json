@@ -1,0 +1,88 @@
+{
+  "description": "Safe Prophet cache-reuse workload for max_seq_len=4096. Repeated 2k-ish context, tiny query tail, short decode.",
+  "captures": [
+    {
+      "label": "serving-report-2k-base",
+      "prompt": "You are evaluating a GPU serving incident report. Use only the report below. Keep the final answer concise.\n\nREPORT START\n",
+      "prompt_parts": [
+        {
+          "text": "Telemetry row: tenant=atlas, route=/v1/chat, artifact=mgx-int8, tokenizer=qwen, scheduler=continuous, kv_policy=paged, cache_policy=prophet, signal=prefill dominates when repeated context is large and generated answer length stays small.\n",
+          "repeat": 40
+        },
+        "\nREPORT END\nTask: In two short bullets, explain whether Prophet should reduce TTFT for this request."
+      ]
+    },
+    {
+      "label": "policy-report-2k-base",
+      "prompt": "You are reviewing a production LLM cache policy note. Use only the note below.\n\nNOTE START\n",
+      "prompt_parts": [
+        {
+          "text": "Policy row: model=qwen2.5-3b, runtime=mgx, state_cache=prophet, workload=shared-prefix, tail=small, decode=short, risk=stale-state, mitigation=exact-prefix-or-validated-restore.\n",
+          "repeat": 52
+        },
+        "\nNOTE END\nTask: Give a compact recommendation for using Prophet on this traffic pattern."
+      ]
+    }
+  ],
+  "queries": [
+    {
+      "label": "serving-2k-exact",
+      "prompt": "You are evaluating a GPU serving incident report. Use only the report below. Keep the final answer concise.\n\nREPORT START\n",
+      "prompt_parts": [
+        {
+          "text": "Telemetry row: tenant=atlas, route=/v1/chat, artifact=mgx-int8, tokenizer=qwen, scheduler=continuous, kv_policy=paged, cache_policy=prophet, signal=prefill dominates when repeated context is large and generated answer length stays small.\n",
+          "repeat": 40
+        },
+        "\nREPORT END\nTask: In two short bullets, explain whether Prophet should reduce TTFT for this request."
+      ]
+    },
+    {
+      "label": "serving-2k-tail-metric",
+      "prompt": "You are evaluating a GPU serving incident report. Use only the report below. Keep the final answer concise.\n\nREPORT START\n",
+      "prompt_parts": [
+        {
+          "text": "Telemetry row: tenant=atlas, route=/v1/chat, artifact=mgx-int8, tokenizer=qwen, scheduler=continuous, kv_policy=paged, cache_policy=prophet, signal=prefill dominates when repeated context is large and generated answer length stays small.\n",
+          "repeat": 40
+        },
+        "\nREPORT END\nTask: In two short bullets, explain whether Prophet should reduce TTFT for this request. Name one metric to watch."
+      ]
+    },
+    {
+      "label": "serving-2k-tail-rollback",
+      "prompt": "You are evaluating a GPU serving incident report. Use only the report below. Keep the final answer concise.\n\nREPORT START\n",
+      "prompt_parts": [
+        {
+          "text": "Telemetry row: tenant=atlas, route=/v1/chat, artifact=mgx-int8, tokenizer=qwen, scheduler=continuous, kv_policy=paged, cache_policy=prophet, signal=prefill dominates when repeated context is large and generated answer length stays small.\n",
+          "repeat": 40
+        },
+        "\nREPORT END\nTask: In two short bullets, explain whether Prophet should reduce TTFT for this request. Add one rollback trigger."
+      ]
+    },
+    {
+      "label": "policy-2k-exact",
+      "prompt": "You are reviewing a production LLM cache policy note. Use only the note below.\n\nNOTE START\n",
+      "prompt_parts": [
+        {
+          "text": "Policy row: model=qwen2.5-3b, runtime=mgx, state_cache=prophet, workload=shared-prefix, tail=small, decode=short, risk=stale-state, mitigation=exact-prefix-or-validated-restore.\n",
+          "repeat": 52
+        },
+        "\nNOTE END\nTask: Give a compact recommendation for using Prophet on this traffic pattern."
+      ]
+    },
+    {
+      "label": "policy-2k-tail-slo",
+      "prompt": "You are reviewing a production LLM cache policy note. Use only the note below.\n\nNOTE START\n",
+      "prompt_parts": [
+        {
+          "text": "Policy row: model=qwen2.5-3b, runtime=mgx, state_cache=prophet, workload=shared-prefix, tail=small, decode=short, risk=stale-state, mitigation=exact-prefix-or-validated-restore.\n",
+          "repeat": 52
+        },
+        "\nNOTE END\nTask: Give a compact recommendation for using Prophet on this traffic pattern. Mention TTFT SLO impact."
+      ]
+    },
+    {
+      "label": "off-domain-control",
+      "prompt": "Why does sourdough bread taste more acidic than regular bread?"
+    }
+  ]
+}

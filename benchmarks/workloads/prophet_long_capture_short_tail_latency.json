@@ -1,0 +1,30 @@
+{
+  "captures": [
+    {
+      "label": "latency-long-base",
+      "prompt": "Explain why compiled model artifacts reduce cold-start latency in GPU serving. Cover TTFT, weight loading, tokenizer startup, CUDA context creation, graph warmup, memory mapping, scheduler readiness, and why avoiding repeated runtime initialization improves startup consistency during autoscaling."
+    }
+  ],
+  "queries": [
+    {
+      "label": "latency-exact-long",
+      "prompt": "Explain why compiled model artifacts reduce cold-start latency in GPU serving. Cover TTFT, weight loading, tokenizer startup, CUDA context creation, graph warmup, memory mapping, scheduler readiness, and why avoiding repeated runtime initialization improves startup consistency during autoscaling."
+    },
+    {
+      "label": "latency-append-short",
+      "prompt": "Explain why compiled model artifacts reduce cold-start latency in GPU serving. Cover TTFT, weight loading, tokenizer startup, CUDA context creation, graph warmup, memory mapping, scheduler readiness, and why avoiding repeated runtime initialization improves startup consistency during autoscaling. Add one practical deployment example."
+    },
+    {
+      "label": "latency-append-medium",
+      "prompt": "Explain why compiled model artifacts reduce cold-start latency in GPU serving. Cover TTFT, weight loading, tokenizer startup, CUDA context creation, graph warmup, memory mapping, scheduler readiness, and why avoiding repeated runtime initialization improves startup consistency during autoscaling. Add one practical deployment example and mention a strict TTFT SLO."
+    },
+    {
+      "label": "latency-refocus-short",
+      "prompt": "Explain why compiled model artifacts reduce cold-start latency in GPU serving. Cover TTFT, weight loading, tokenizer startup, CUDA context creation, graph warmup, memory mapping, scheduler readiness, and why avoiding repeated runtime initialization improves startup consistency during autoscaling. Focus on pod startup behavior."
+    },
+    {
+      "label": "latency-refocus-medium",
+      "prompt": "Explain why compiled model artifacts reduce cold-start latency in GPU serving. Cover TTFT, weight loading, tokenizer startup, CUDA context creation, graph warmup, memory mapping, scheduler readiness, and why avoiding repeated runtime initialization improves startup consistency during autoscaling. Focus on pod startup behavior and health-check readiness gates."
+    }
+  ]
+}
