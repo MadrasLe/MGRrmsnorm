@@ -173,6 +173,7 @@ tokens, two warmups and five repetitions; [report](docs/qwen25_cpu_microgemm_vs_
 - 🔄 **RoPE (CUDA)** — rotary position embeddings with half-rotate
 - 📄 **PagedAttention (Triton)** — paged KV decode with online softmax
 - 🧩 **Qwen 3.5 fused decode** — fused RMSNorm+in-proj for `GatedDeltaNet` linear attention, fused RoPE+attn, deepfusion MLP, fused `lm_head` argmax
+- 🌊 **Qwen 3.5 scan kernels** — chunked delta-rule prefill, interchunk affine composition, Hillis–Steele and Blelloch implementations, and GPU-aware launch policy
 
 ---
 
@@ -522,6 +523,35 @@ HuggingFace Model
  └──────────────────────────────┘
 ```
 
+### Why Qwen 3.5 has a dedicated hybrid runtime
+
+Qwen 3.5 alternates ordinary full-attention blocks with `GatedDeltaNet` linear
+attention. The default synthesized layout places one full-attention layer every
+four layers, so execution, state storage, prefill, and decode cannot use one
+homogeneous transformer path.
+
+| Mechanism | MegaGemm implementation |
+|---|---|
+| **Hybrid layer topology** | Full-attention layers use paged KV, QK normalization, partial RoPE, and an attention-output gate. Linear layers carry convolution and recurrent delta-rule state instead of allocating ordinary KV pages. |
+| **GatedDeltaNet core** | Fused Q/K/V and beta/A/z input projections feed a depthwise causal convolution, learned decay/update gates, recurrent state update, RMSNorm+SiLU output gating, and the output projection. |
+| **Prefill regimes** | Short sequences use a recurrent Triton prefill path. Longer sequences use the chunked delta rule, a chunk-local triangular solve, and an interchunk scan; runtime thresholds vary by GPU capability. |
+| **Affine prefix scans** | Each chunk is represented as `S' = A @ S + B`. The repository implements an inclusive Hillis–Steele scan plus Torch and Triton Blelloch upsweep/downsweep paths. Blelloch remains preserved and tested, but the current selector maps it to Hillis–Steele because the dense-affine Blelloch route regressed Qwen 3.5 long-prefill on T4. |
+| **Profile-driven policy** | Scan window size, warp count, and short-prefill threshold are selected from GPU generation and problem geometry. Fused RMSNorm+input-projection and RMSNormGated+output-projection routes are measured against their baselines on-device and cached only when they clear the configured gain threshold. |
+| **Decode fast path** | Reusable buffers, fused causal-convolution update, fused gate/recurrent update, FP16 core output, fast linear backends, flat hybrid execution, deepfusion MLP, and fused `lm_head` argmax reduce launch and allocation overhead. |
+
+The Qwen 3.5 kernel surface contains **20 Triton JIT routines** across linear
+attention and its fused gated-normalization projections. Its regression module
+contains **56 test functions** covering hybrid config parsing, partial RoPE,
+runtime policy, Hillis–Steele/Blelloch correctness, recurrent-versus-chunked
+parity, causal convolution, GQA, fused projections, sparse KV allocation,
+continuous batching, and packed prefill.
+
+The repository also preserves T4/L4 suite runners and vLLM matrix presets for
+Qwen 3.5 0.8B, 2B, 4B, and 9B. Older project runs recorded strong leads over
+vLLM in selected Qwen 3.5 regimes, but their raw reports are not present in the
+current publication bundle; they therefore remain historical development
+evidence rather than a numeric headline claim.
+
 ### Why Gemma 4 has a dedicated execution path
 
 Gemma 4 is not handled as a renamed dense decoder. Its text backbone mixes layer
@@ -558,9 +588,10 @@ and eager/flat-path parity.
 | **Prophet** | [`megagemm/engine/prophet.py`](megagemm/engine/prophet.py) | Semantic state library |
 | **Mesh** | [`megagemm/mesh/`](megagemm/mesh/) | Distributed replica + layer-shard inference over TTP |
 | **Attention** | [`megagemm/kernels/paged_attention.py`](megagemm/kernels/paged_attention.py) | Triton paged attention decode |
-| **Linear attn** | [`megagemm/kernels/linear_attention.py`](megagemm/kernels/linear_attention.py) | Qwen 3.5 GatedDeltaNet |
+| **Qwen 3.5 linear attn** | [`megagemm/kernels/linear_attention.py`](megagemm/kernels/linear_attention.py) | Recurrent/chunked GatedDeltaNet, affine scans, Hillis–Steele, and experimental Blelloch paths |
+| **Qwen 3.5 fused gates** | [`megagemm/kernels/rmsnorm_gated.py`](megagemm/kernels/rmsnorm_gated.py), [`rmsnorm_gated_linear.py`](megagemm/kernels/rmsnorm_gated_linear.py) | Fused RMSNorm+SiLU gate and gated output projection |
 | **Qwen3 MoE** | [`megagemm/kernels/qwen3_moe.py`](megagemm/kernels/qwen3_moe.py) | Mixture-of-experts kernels |
-| **Gemma 4 attention** | [`megagemm/kernels/gemma4_attention_prepare.py`](megagemm/kernels/gemma4_attention_prepare.py) | Fused PLE-era Q/K/V normalization, RoPE, layout preparation, and KV write |
+| **Gemma 4 attention** | [`megagemm/kernels/gemma4_attention_prepare.py`](megagemm/kernels/gemma4_attention_prepare.py) | Fused Gemma 4 Q/K/V normalization, RoPE, layout preparation, and KV write |
 | **Gemma 4 MoE** | [`megagemm/kernels/gemma4_moe_router.py`](megagemm/kernels/gemma4_moe_router.py), [`gemma4_grouped_prefill.py`](megagemm/kernels/gemma4_grouped_prefill.py) | Top-k routing and grouped expert-prefill kernels |
 | **RMSNorm** | [`src/rmsnorm_kernel.cu`](src/rmsnorm_kernel.cu) | CUDA kernel |
 | **INT8 / W4A16 / AWQ** | [`megagemm/quantization/`](megagemm/quantization/) | W8A16 / native W4A16(+2:4) / AWQ |
@@ -577,7 +608,7 @@ and eager/flat-path parity.
 | **Mistral** | `mistralai/Mistral-7B-Instruct-v0.3` | ✅ | ✅ | — | Validated |
 | **Qwen 2.5** | `Qwen/Qwen2.5-7B-Instruct` | ✅ | ✅ | ✅ | Validated |
 | **Qwen 3** | `Qwen/Qwen3-8B` | ✅ | ✅ | — | Validated |
-| **Qwen 3.5** | `Qwen/Qwen3.5-4B` | ✅ | — | — | Native hybrid linear-attention (text backbone) |
+| **Qwen 3.5** | `Qwen/Qwen3.5-4B` | ✅ | — | — | Native hybrid full/GatedDeltaNet runtime with recurrent state and chunked prefill (text backbone) |
 | **Gemma 2** | `google/gemma-2-*` | ✅ | ✅ | — | Dense Gemma path |
 | **Gemma 4 text backbone** | `gemma4_text` architecture | ✅ | ✅ | — | Sliding/full attention, per-layer RoPE/head geometry, KV sharing, and PLE |
 | **Gemma 4 MoE** | `gemma4_text` + `enable_moe_block` | ✅ | ✅ | — | Shared dense + routed experts; selected A100 A4B shapes have tuned paths |

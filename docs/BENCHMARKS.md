@@ -89,9 +89,19 @@ evidence and must remain separate from the uncached FP16 result.
 
 Older T4, Hugging Face, quantized, and Qwen 3.5 measurements guided runtime
 development, but their raw reports are not included in the current curated
-publication bundle. They must be restored with their evidence or rerun before
-promotion. The August uncached L4 matrix and the separate Prophet cache-reuse
-matrix above are the current GPU results.
+publication bundle and therefore remain unpromoted historical evidence. The
+August uncached L4 matrix and the separate Prophet cache-reuse matrix above are
+the current GPU results.
+
+The Qwen 3.5 infrastructure itself remains versioned:
+[`run_qwen35_t4_suite.py`](../benchmarks/run_qwen35_t4_suite.py) and
+[`run_qwen35_l4_suite.py`](../benchmarks/run_qwen35_l4_suite.py) exercise native
+hybrid inference, while
+[`run_qwen_vllm_t4_suite.py`](../benchmarks/run_qwen_vllm_t4_suite.py) carries
+vLLM presets for the 0.8B, 2B, 4B, and 9B checkpoints. Historical project runs
+recorded strong MegaGemm leads in selected Qwen 3.5 regimes. No numeric result
+is promoted here because the corresponding raw JSON/Markdown bundle is absent
+from the repository.
 
 ## CPU: MicroGemm versus llama.cpp
 

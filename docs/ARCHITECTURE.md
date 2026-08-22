@@ -67,6 +67,56 @@ MoE, full-attention, and hybrid linear-attention families. Specialized fast
 paths coexist with fallbacks because the runtime targets multiple GPU
 generations and model shapes.
 
+### Qwen 3.5 hybrid full/linear attention
+
+Qwen 3.5 is represented as a layer-local hybrid rather than a conventional
+full-attention transformer. When a checkpoint does not provide an explicit
+layout, the runtime synthesizes one full-attention layer followed by three
+linear-attention layers. Full-attention blocks retain paged KV, QK normalization,
+partial RoPE, and the output gate. Linear blocks instantiate `GatedDeltaNet` and
+store depthwise-convolution plus recurrent delta-rule state in the block manager.
+Layer-aware cache allocation therefore reserves ordinary KV pages only for the
+full-attention subset.
+
+`GatedDeltaNet` combines fused Q/K/V and beta/A/z projections, a depthwise causal
+convolution, learned decay and update gates, a recurrent key/value state,
+RMSNorm+SiLU output gating, and a final projection. Decode has dedicated Triton
+routes for causal-convolution update, recurrent gated-delta update, fused A/B
+gate formation, RMSNorm+input projection, and RMSNormGated+output projection.
+Reusable decode buffers and the flat hybrid loop remove intermediate allocation
+and Python/module dispatch from the hot path.
+
+Prefill is regime-dependent. Short prompts use recurrent Triton prefill; longer
+prompts use the chunked delta rule, a local triangular solve, and an interchunk
+state scan. The scan treats each chunk as an affine transition
+`S' = A @ S + B`, so chunk prefixes can be composed associatively.
+
+Two parallel prefix families are implemented:
+
+- **Hillis–Steele:** an inclusive logarithmic-stage affine scan, with a Triton
+  route and a tensor fallback;
+- **Blelloch:** power-of-two padding, upsweep, downsweep, and final inclusive
+  composition, implemented both as a Torch reference and Triton affine kernels.
+
+Blelloch is retained as implemented and correctness-tested research work, but
+the current selector maps Blelloch aliases to Hillis–Steele because the
+dense-affine Blelloch path regressed Qwen 3.5 long-prefill on T4. The default
+policy also keeps the parallel scan opt-in and rejects wide-head cases by default
+unless explicitly forced.
+
+Runtime policy is hardware- and shape-aware. GPU capability selects the short
+prefill threshold, scan window, and warp count; the window chooser avoids small
+tail launches, and stable chunk buckets reduce Triton recompilation. Separate
+on-device microprofiles compare fused and baseline input/output projection paths,
+cache the result by tensor signature, and require the configured minimum gain
+before enabling a fusion.
+
+The dedicated regression surface contains 56 tests. The linear-attention and
+gated-normalization kernel files contain 20 Triton JIT routines. Coverage spans
+partial RoPE, hybrid scheduling, scan policy, Hillis–Steele and Blelloch affine
+correctness, recurrent/chunked parity, convolution state, GQA, fused gates,
+continuous batching, packed prefill, and layer-aware KV behavior.
+
 ### Gemma 4 mixed-layer text backbone
 
 Gemma 4 has a dedicated architecture contract in the runtime; it is not routed
