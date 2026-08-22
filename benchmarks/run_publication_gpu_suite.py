@@ -28,13 +28,18 @@ COMPARE = ROOT / "benchmarks" / "compare_inference_summaries.py"
 class Variant:
     name: str
     backend: str
+    dtype: str = "fp16"
     quantize: str | None = None
 
 
 VARIANTS = {
     "megagemm-fp16": Variant("megagemm-fp16", "megagemm"),
     "vllm-fp16": Variant("vllm-fp16", "vllm"),
-    "megagemm-int8": Variant("megagemm-int8", "megagemm", "int8"),
+    "megagemm-bf16": Variant("megagemm-bf16", "megagemm", dtype="bf16"),
+    "vllm-bf16": Variant("vllm-bf16", "vllm", dtype="bf16"),
+    "megagemm-int8": Variant(
+        "megagemm-int8", "megagemm", dtype="fp16", quantize="int8"
+    ),
 }
 
 
@@ -114,7 +119,7 @@ def command_for(
         "--device",
         "cuda",
         "--dtype",
-        "fp16",
+        variant.dtype,
         "--max-seq-len",
         str(args.max_seq_len),
         "--max-batch-size",
@@ -162,7 +167,10 @@ def main() -> int:
     parser.add_argument(
         "--variants",
         default="megagemm-fp16,vllm-fp16",
-        help="Comma-separated: megagemm-fp16,vllm-fp16,megagemm-int8",
+        help=(
+            "Comma-separated: megagemm-fp16,vllm-fp16,megagemm-bf16,"
+            "vllm-bf16,megagemm-int8"
+        ),
     )
     parser.add_argument("--batch-sizes", default="1,8")
     parser.add_argument("--prompt-tokens", default="128,512,2048")
@@ -225,10 +233,13 @@ def main() -> int:
         print(f"\n=== {variant.name} ===", flush=True)
         subprocess.run(command, cwd=ROOT, check=True)
 
-    vllm = next((item for item in variants if item.name == "vllm-fp16"), None)
-    if vllm is not None:
+    for vllm in (item for item in variants if item.backend == "vllm"):
         right = summary_path(run_dir, run_id, hardware_label, vllm)
-        for left in (item for item in variants if item.backend == "megagemm"):
+        for left in (
+            item
+            for item in variants
+            if item.backend == "megagemm" and item.dtype == vllm.dtype
+        ):
             left_path = summary_path(run_dir, run_id, hardware_label, left)
             if not left_path.exists() or not right.exists():
                 continue
