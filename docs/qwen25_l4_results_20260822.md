@@ -88,14 +88,14 @@ and timing, not a cross-backend token-by-token correctness comparison.
 
 The compact matrix used only three repetitions. Several MegaGemm batch-1 first
 samples were slower than the following samples, consistent with shape-specific
-warmup or compilation. The median remained stable, but a release-grade matrix
-should use at least two warmups and five repetitions across batches 1, 2, 4,
-and 8.
+warmup or compilation. The median remained stable, but the matrix falls below
+the release-grade evidence contract of at least two warmups and five repetitions
+across batches 1, 2, 4, and 8.
 
 The source directory copied into Colab did not contain Git metadata, so the
 recorded commit is `null`. The archive still captures the commands and software
 environment, but the run is not tied to an immutable repository revision.
-Future headline reruns should execute from a clean committed checkout.
+This prevents commit-level reproduction from a clean checkout.
 
 MGX+Prophet cache-hit results are intentionally documented in
 [`qwen25_l4_prophet_results_20260822.md`](qwen25_l4_prophet_results_20260822.md):

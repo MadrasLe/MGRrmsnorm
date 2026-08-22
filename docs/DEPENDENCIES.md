@@ -37,7 +37,7 @@ flash-attn
 
 Only `torch` is mandatory for the base installation. The final number of
 installed distributions is larger because dependencies are transitive; the
-direct count should not be presented as the complete environment size.
+direct count is not the complete environment size.
 
 ## Extras
 

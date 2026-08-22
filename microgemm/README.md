@@ -17,17 +17,18 @@ The target is closer to the spirit of `llama.cpp`, but with a cleaner and more c
 This folder is intentionally separate from the main `megagemm/` package.
 MicroGemm is not allowed to depend on that package, or on any Python-side model stack, to function.
 
-## Philosophy
+## Design priorities
 
-MicroGemm should optimize for:
+MicroGemm is designed around:
 
-- purity: the runtime and the converter should stand on their own;
+- purity: the runtime and converter stand on their own;
 - portability: easy to cross-compile and ship on constrained systems;
 - simplicity: fewer moving parts than the main MegaGemm codebase;
 - mechanical sympathy: tight CPU kernels, low allocator pressure, explicit buffers, predictable layouts;
 - practical performance: strong real-world decode speed on modest hardware.
 
-That means MicroGemm should look like a focused systems project, not a Python-first ML stack.
+These constraints position MicroGemm as a focused systems project rather than a
+Python-first ML stack.
 
 ## Current Scope
 
@@ -146,8 +147,7 @@ python tools/benchmark_vs_hf.py \
 That benchmark reports `prefill_ms`, `decode_ms`, `total_ms`, `prefill_tps`,
 `decode_tps`, and `total_tps` for both MicroGemm and Hugging Face side by side.
 
-For the project-wide inference matrix, CPU performance benchmarks should use
-the MicroGemm backend:
+The project-wide CPU inference matrix uses the MicroGemm backend:
 
 ```bash
 python ../benchmarks/benchmark_inference_matrix.py \
@@ -193,8 +193,8 @@ tensors packed in memory and uses packed GEMV kernels for decode/prefill/logits
 paths. Persisted `row_sum` tensors avoid scanning and unpacking all INT4 weights
 at model load time. INT4 batch decode uses AVX2 batched-row tiles for generic
 GEMV paths and a fused packed `gate_up` path before SwigLU. INT8 still uses its
-separate fused fast kernels; further INT4 work should be guided by the per-op
-profile.
+separate fused fast kernels. The per-op profile is the evidence surface for
+remaining INT4 bottlenecks.
 
 To compare against `llama.cpp`, use `tools/benchmark_vs_llamacpp.py` with a
 GGUF of the same model:
@@ -211,8 +211,8 @@ python tools/benchmark_vs_llamacpp.py \
   --temperature 0.0
 ```
 
-If you just want one Colab entrypoint that does the full flow end to end
-without benchmarking from Google Drive, use `tools/colab_benchmark_all.sh`.
+`tools/colab_benchmark_all.sh` is the single Colab entrypoint for the full flow
+without benchmarking from Google Drive.
 It copies the standalone `microgemm/` tree into `/content`, recompiles there,
 downloads the HF snapshot and matching GGUF, builds `llama.cpp`, converts the
 model to `.mgm`, and runs the final CPU benchmark:
@@ -223,7 +223,7 @@ cd /content/drive/MyDrive/microgemm
 bash tools/colab_benchmark_all.sh
 ```
 
-You can override the prompt and a few benchmark knobs through environment
+The prompt and selected benchmark knobs are configurable through environment
 variables:
 
 ```bash
@@ -310,22 +310,24 @@ It still rejects more advanced variants that the runtime does not yet model corr
 - long-context hybrid local/global attention semantics that require per-layer
   attention masks or per-layer RoPE variants
 
-## Non-Goals
+## Current non-goals
 
-At least in the early phases, MicroGemm should avoid becoming:
+The current scope excludes:
 
 - a second research sandbox;
 - a large abstraction framework;
 - a runtime that depends on the main MegaGemm package to execute inference;
 - a runtime or converter that depends on Python, PyTorch, or Hugging Face.
 
-If a feature hurts portability, simplicity, or runtime purity, it should be treated as suspect.
+Portability, simplicity, and runtime purity are acceptance constraints for new
+runtime surface.
 
-## Near-Term Roadmap
+## Current implementation boundary
 
-1. Freeze the first decoder-only target layout.
-2. Harden and validate the current native decode path on Linux/Colab CPU.
-3. Improve tokenizer coverage and correctness beyond the first BPE-only path.
-4. Add multi-file safetensors ingestion.
-5. Add sampling and better text-generation controls.
-6. Add memory-mapped loading and tighter deployment packaging.
+- The first decoder-only target layout remains versioned rather than frozen.
+- Validation is concentrated on Linux/Colab CPU and the hardware represented in
+  dated benchmark notes.
+- Native tokenizer coverage is currently limited to the documented BPE path.
+- The converter does not ingest multi-file safetensors checkpoints directly.
+- Sampling exposes the documented initial temperature/top-k/top-p controls.
+- Model loading is not memory-mapped, and deployment packaging remains minimal.

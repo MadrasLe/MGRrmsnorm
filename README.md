@@ -88,16 +88,16 @@ vLLM is a strong, mature baseline. The truth is **it depends on the regime**:
 > **Cache-reuse takeaway:** Prophet won three of four rows and reached **102.8%** of vLLM's
 > geometric-mean cached throughput, a 2.8% lead in this matrix. This measures repeated exact-prefix
 > hits, not semantically similar prompts. Prophet validation was disabled, and the raw JSON/CSV
-> bundle has not yet been copied from Colab; see the report before quoting the result.
+> bundle is not present in this repository. The linked report records the exact evidence boundary.
 
-### Where vLLM still wins (don't pretend otherwise)
+### Where vLLM leads
 
 - **High-batch, long-context, full-attention throughput** remains the clearest gap: in the current
   L4 Qwen 2.5 FP16 row at batch 8 / prompt 2048, vLLM leads by 15.7%. Older T4 configurations
   recorded substantially larger gaps.
 - **Breadth and battle-testing**: far more models, quantization formats, and production hardening.
-- MegaGemm has **no FlashAttention path on its packed attention** yet (it falls back to per-sequence
-  SDPA on the PyTorch backend) — a known optimization target.
+- MegaGemm has **no FlashAttention path on its packed attention**; that path falls back to
+  per-sequence SDPA on the PyTorch backend.
 
 ### CPU: MicroGemm versus llama.cpp
 
@@ -119,20 +119,23 @@ tokens, two warmups and five repetitions; [report](docs/qwen25_cpu_microgemm_vs_
 > MicroGemm's continuous batching scales to a 1.65x engine and 1.66x decode geometric-mean lead
 > across batches 4-8. Across all four batches, MicroGemm reaches **1.286x geometric-mean engine
 > throughput**. The formats are not quality-identical, the MicroGemm canary was slow, and the raw
-> JSON/CSV bundle still needs to be copied from Colab; see the report before quoting the result.
+> JSON/CSV bundle is not present in this repository. The linked report records these limitations.
 
 ---
 
 ## ✨ Features
 
 ### Inference Engine
-- 🧠 **Multi-Model** — LLaMA 3.x, Mistral 7B, Qwen 2.5, Qwen 3, **Qwen 3.5 (hybrid linear-attention)**, Gemma
+- 🧠 **Multi-Model** — LLaMA 3.x, Mistral 7B, Qwen 2.5, Qwen 3, **Qwen 3.5 (hybrid linear-attention)**, Gemma 2, and **Gemma 4 mixed-layer/MoE text backbones**
 - 🔢 **INT8 W8A16** — per-channel, 2x compression, ~0.999 cosine similarity, **faster than FP16**
 - 🧱 **AWQ 4-bit** — load pre-quantized AWQ models (4x compression)
 - 📄 **Paged KV Cache** — BlockManager with configurable block size + **layer-aware allocation**
 - 🔄 **KV Cache CPU Offload** — `TieredBlockManager` moves cold KV to pinned CPU RAM (10x capacity, 0% quality loss)
 - ⚡ **Paged Attention** — Triton decode kernel with online softmax
 - 🧬 **GQA / MQA** — grouped-query and multi-query attention
+- 🧬 **Gemma 4 heterogeneous attention** — per-layer head/KV geometry and RoPE, sliding/full attention schedules, K=V and cross-layer KV sharing
+- 🧬 **Gemma 4 PLE** — learned per-layer embeddings combined with projected token embeddings and injected through gated, normalized layer-local branches
+- 🧠 **Gemma 4 MoE** — shared dense branch plus routed experts, with custom top-k routing and grouped/segmented prefill paths
 - 🔄 **Continuous Batching** — iteration-level scheduler
 - 💾 **Layer Offloading** — run models larger than VRAM (GPU+CPU)
 
@@ -460,8 +463,9 @@ python -m megagemm export-mgx --model Qwen/Qwen2.5-1.5B-Instruct --out artifacts
 Add `--sparsity 2:4` for the standalone packed sparse variant. Existing FP16,
 BF16, INT8, and AWQ loading/export paths remain unchanged.
 
-> ⚠️ INT8 results above are **performance** results. A separate accuracy/perplexity regression check
-> is still recommended before quoting INT8 for quality-sensitive use.
+> ⚠️ INT8 results above are **performance** results. The repository does not contain
+> accuracy/perplexity evidence for every quoted quantized configuration, so these figures do not
+> establish model-quality parity.
 
 ---
 
@@ -513,14 +517,39 @@ HuggingFace Model
  │  • RoPE (CUDA)                │
  │  • PagedAttn (Triton)         │
  │  • Qwen3.5 fused decode       │
+ │  • Gemma4 attention prepare   │
+ │  • Gemma4 router/grouped MoE  │
  └──────────────────────────────┘
 ```
+
+### Why Gemma 4 has a dedicated execution path
+
+Gemma 4 is not handled as a renamed dense decoder. Its text backbone mixes layer
+types and carries architecture state that changes the tensor contract from one
+layer to the next:
+
+| Mechanism | MegaGemm implementation |
+|---|---|
+| **Mixed attention layout** | The config materializes a per-layer schedule of sliding-window and full-attention blocks; the default layout is five sliding layers followed by one full layer. |
+| **Layer-local geometry** | Head dimension, KV-head count, rotary dimension, and RoPE theta are stored per layer. Full and sliding layers can therefore use different Q/K/V shapes and positional encodings. |
+| **KV reuse semantics** | Late KV-shared layers resolve to an earlier compatible source layer instead of allocating duplicate cache storage. Full-attention layers can also use the architecture's K=V mode. |
+| **Per-layer embeddings (PLE)** | Token-indexed per-layer embeddings are scaled by `sqrt(hidden_size_per_layer_input)`. A projection of the base token embedding is independently scaled and RMS-normalized; both streams are combined with `1/sqrt(2)`. Each decoder layer then applies a GELU gate, elementwise conditioning, projection, post-PLE RMSNorm, residual addition, and a learned layer scalar. |
+| **Gemma 4 MoE** | `Gemma4MoeMLP` implements the architecture's shared dense branch and routed expert branch. Routing includes input RMSNorm, router scaling, top-k selection, optional probability renormalization, and per-expert scales. |
+| **Specialized GPU paths** | Dedicated Triton paths fuse attention preparation (Q/K/V normalization, RoPE, layout conversion, and KV write), long sliding/full prefill, MoE routing, grouped expert prefill, deterministic route packing/reduction, and selected A100 A4B-shaped decode/prefill graphs. |
+
+The loader accepts Gemma 4 multimodal checkpoint layouts but executes the **text
+backbone**; the vision/audio towers are outside the current runtime. FP16/BF16
+and streaming INT8 W8A16 loading are wired for this path, while Gemma 4 AWQ is
+explicitly unsupported. The regression surface contains **16 Gemma 4-specific
+test modules and 236 test functions**, covering config layout, PLE, heterogeneous
+KV/cache semantics, attention, MoE routing, prefill, decode, INT8, graph gates,
+and eager/flat-path parity.
 
 ### Key Components
 
 | Component | File | Description |
 |-----------|------|-------------|
-| **Model** | [`megagemm/models/llama.py`](megagemm/models/llama.py) | Unified transformer (LLaMA/Mistral/Qwen/Qwen3.5/Gemma) |
+| **Model** | [`megagemm/models/llama.py`](megagemm/models/llama.py) | Unified dense, hybrid, and MoE execution, including Gemma 4 layer-local contracts |
 | **Loader** | [`megagemm/models/loader.py`](megagemm/models/loader.py) | HF weight loading, QKV fusion, quantization |
 | **MGX** | [`megagemm/models/mgx.py`](megagemm/models/mgx.py) | Compiled artifact format + session state |
 | **Engine** | [`megagemm/engine/engine.py`](megagemm/engine/engine.py) | Generation loop, sampling, chat templates |
@@ -531,6 +560,8 @@ HuggingFace Model
 | **Attention** | [`megagemm/kernels/paged_attention.py`](megagemm/kernels/paged_attention.py) | Triton paged attention decode |
 | **Linear attn** | [`megagemm/kernels/linear_attention.py`](megagemm/kernels/linear_attention.py) | Qwen 3.5 GatedDeltaNet |
 | **Qwen3 MoE** | [`megagemm/kernels/qwen3_moe.py`](megagemm/kernels/qwen3_moe.py) | Mixture-of-experts kernels |
+| **Gemma 4 attention** | [`megagemm/kernels/gemma4_attention_prepare.py`](megagemm/kernels/gemma4_attention_prepare.py) | Fused PLE-era Q/K/V normalization, RoPE, layout preparation, and KV write |
+| **Gemma 4 MoE** | [`megagemm/kernels/gemma4_moe_router.py`](megagemm/kernels/gemma4_moe_router.py), [`gemma4_grouped_prefill.py`](megagemm/kernels/gemma4_grouped_prefill.py) | Top-k routing and grouped expert-prefill kernels |
 | **RMSNorm** | [`src/rmsnorm_kernel.cu`](src/rmsnorm_kernel.cu) | CUDA kernel |
 | **INT8 / W4A16 / AWQ** | [`megagemm/quantization/`](megagemm/quantization/) | W8A16 / native W4A16(+2:4) / AWQ |
 | **XAI** | [`megagemm/engine/xai.py`](megagemm/engine/xai.py) | Token uncertainty telemetry + Logit Lens |
@@ -547,9 +578,12 @@ HuggingFace Model
 | **Qwen 2.5** | `Qwen/Qwen2.5-7B-Instruct` | ✅ | ✅ | ✅ | Validated |
 | **Qwen 3** | `Qwen/Qwen3-8B` | ✅ | ✅ | — | Validated |
 | **Qwen 3.5** | `Qwen/Qwen3.5-4B` | ✅ | — | — | Native hybrid linear-attention (text backbone) |
-| **Gemma** | `google/gemma-*` | ✅ | ✅ | — | Replica only in mesh |
+| **Gemma 2** | `google/gemma-2-*` | ✅ | ✅ | — | Dense Gemma path |
+| **Gemma 4 text backbone** | `gemma4_text` architecture | ✅ | ✅ | — | Sliding/full attention, per-layer RoPE/head geometry, KV sharing, and PLE |
+| **Gemma 4 MoE** | `gemma4_text` + `enable_moe_block` | ✅ | ✅ | — | Shared dense + routed experts; selected A100 A4B shapes have tuned paths |
 
 > Models auto-detect architecture, RoPE convention, and chat templates from HuggingFace config.
+> Gemma 4 support currently refers to text-backbone inference, not execution of multimodal towers.
 
 ---
 
@@ -571,7 +605,7 @@ engine = InferenceEngine(
 )
 
 output = engine.generate(
-    prompt="Your prompt",
+    prompt="Explain paged attention in one paragraph.",
     max_new_tokens=200,
     temperature=0.7,          # 0 = greedy
     top_p=0.9,
@@ -598,9 +632,10 @@ rope = RoPE(head_dim=128, max_seq_len=2048)
 - **No FlashAttention path** on packed attention yet (per-sequence SDPA fallback on PyTorch backend).
 - **MegaMesh** layer-shard mode is experimental: greedy-only, per-prompt prefill, no quantized
   shards, CPU-mediated TTP transport (no NCCL/GPU-direct).
-- **INT8 numbers are speed/memory**, not validated quality — run an accuracy check before relying on it.
+- **INT8 numbers are speed/memory**, not validated quality; they do not establish
+  accuracy or perplexity parity.
 - Benchmarks are project-run **Colab/Kaggle T4 & L4** measurements (May-August 2026), generally
-  fixed-decode with `--ignore-eos`. Rerun on your hardware; absolute numbers will differ.
+  fixed-decode with `--ignore-eos`. Absolute numbers remain hardware- and stack-dependent.
 
 ---
 
@@ -619,7 +654,7 @@ python -X utf8 tests/test_deterministic.py
 ```
 
 See [`tests/README.md`](tests/README.md) for test classes, GPU requirements, discovery limitations,
-and the consolidation roadmap.
+and current suite boundaries.
 
 ---
 

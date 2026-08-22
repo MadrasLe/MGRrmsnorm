@@ -33,8 +33,8 @@ PowerShell syntax.
 
 ## Correctness before speed
 
-Kernel changes should report maximum absolute/relative error or an appropriate
-task-specific metric. Quantization work must separate speed/memory results from
+Kernel changes include maximum absolute/relative error or an appropriate
+task-specific metric. Quantization work separates speed/memory results from
 quality validation. A faster result with an unexplained correctness change is
 not accepted as a performance improvement.
 

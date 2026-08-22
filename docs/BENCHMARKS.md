@@ -151,12 +151,15 @@ recorded after elevated system load. Source:
   runner used by the current Qwen 2.5 0.5B result.
 - `microgemm/tools/qwen25_llamacpp_batch_compare.py` — llama.cpp paired runner.
 
-## Before a public performance release
+## Release-grade evidence contract
 
-1. Rerun the headline GPU rows in fresh, isolated environments.
-2. Disable prefix caching unless cache behavior is the subject of the test.
-3. Save raw JSON/CSV, console logs, `nvidia-smi`, CPU model, thread affinity,
-   package versions, commit hash, and exact command.
-4. Run correctness/quality checks for every quantized configuration.
-5. Separate TTFT, prefill TPS, decode TPS, end-to-end output TPS, and memory.
-6. Publish failures and OOMs alongside successful rows.
+A release-grade performance record consists of:
+
+1. headline GPU rows produced in fresh, isolated environments;
+2. prefix caching disabled unless cache behavior is the subject of the test;
+3. raw JSON/CSV, console logs, `nvidia-smi`, CPU model, thread affinity,
+   package versions, commit hash, and exact command;
+4. correctness/quality results for every quantized configuration;
+5. separate TTFT, prefill TPS, decode TPS, end-to-end output TPS, and memory
+   measurements;
+6. failures and OOMs retained alongside successful rows.

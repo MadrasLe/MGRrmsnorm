@@ -59,8 +59,8 @@ stack and making the result harder to reproduce.
 ```
 
 This pin reproduces the published L4 stack (`vllm 0.27.1+cu129`, `torch
-2.13.0+cu129`). A newer vLLM release should start a new dated benchmark series
-rather than silently replacing this baseline.
+2.13.0+cu129`). A newer vLLM release defines a new dated benchmark series rather
+than silently replacing this baseline.
 
 Run installation and benchmarks in shell child processes and do not reset or
 replace the Colab runtime between them. A new backend allocation loses the

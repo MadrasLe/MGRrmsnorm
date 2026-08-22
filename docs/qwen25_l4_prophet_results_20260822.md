@@ -73,15 +73,16 @@ against vLLM or validate semantic-reuse correctness. Therefore the result
 supports a performance claim about this exact-prefix cache-hit workload, not an
 output-equivalence or semantic-cache-quality claim.
 
-Before treating this as release-grade evidence, copy or export the following
-Colab outputs into a dated archive:
+## Missing release-grade artifacts
+
+The following Colab outputs are absent from the repository archive:
 
 - Prophet raw JSONL, summary JSON, and summary CSV;
 - vLLM raw JSONL, summary JSON, and summary CSV;
 - `qwen25_prophet_vs_vllm_l4_20260822_152646_prophet_vs_vllm.csv`;
 - both generated Markdown reports;
 - environment manifest and an immutable Git commit;
-- a correctness run with Prophet validation enabled.
+- correctness evidence with Prophet validation enabled.
 
 ## Narrow publication claim
 

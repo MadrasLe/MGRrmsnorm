@@ -73,8 +73,9 @@ more requests are active. At batch 8 it reached 144.44 decode tok/s versus
 
 The MicroGemm profile still identifies the quantized MLP as the main
 bottleneck. At batch 8, `gate_up_dot` consumed about 2,386 ms and
-`down_proj_dot` about 1,145 ms, while RoPE/KV work was about 121 ms. The next
-optimization target remains the quantized gate/up and down-projection dot path.
+`down_proj_dot` about 1,145 ms, while RoPE/KV work was about 121 ms. The
+quantized gate/up and down-projection dot paths therefore dominate the remaining
+profile.
 
 ## Evidence and limitations
 
@@ -88,8 +89,8 @@ the console summary alone.
 The MicroGemm canary classified the single-request decode result as `slow`:
 50.01 tok/s versus its profile's 75 tok/s weak and 85 tok/s good thresholds.
 The paired ratios remain useful because llama.cpp ran on the same allocation,
-but the absolute MicroGemm result may be below its expected performance and
-should be repeated on another allocation.
+but the absolute MicroGemm result may be below its expected performance and has
+not been independently replicated on another allocation.
 
 The formats are both 8-bit but are not quality-identical: MicroGemm uses its
 per-row INT8 layout while llama.cpp uses blockwise Q8_0. No perplexity,
@@ -98,14 +99,14 @@ token-equivalence, or quality test accompanied this throughput run.
 The requested prompt length was 64 tokens. MicroGemm's text harness appends a
 per-request index before tokenization, whereas llama-batched-bench uses its
 synthetic 64-token workload. The raw MicroGemm summary records the actual token
-count and must be checked before making an exact token-identical prefill claim.
-Until then, treat the prefill result as a closely matched requested-length
-comparison.
+count, but that artifact is not present in the repository. The prefill result is
+therefore a closely matched requested-length comparison, not an exact
+token-identical comparison.
 
 The run order was fixed rather than alternated, and the Colab source copy had
-no immutable MegaGemm Git commit. A release-grade rerun should alternate
-backend order, preserve both source commits, hash the converted model files,
-and save raw per-repeat results.
+no immutable MegaGemm Git commit. Alternated backend order, both source commits,
+converted-model hashes, and raw per-repeat results are absent from this evidence
+bundle.
 
 ## Narrow publication claim
 

@@ -58,26 +58,29 @@ pytest-style functions and standalone `main()` harnesses are not all collected
 by unittest. It may also report missing optional native modules in a CPU-only
 environment.
 
-## GPU validation policy
+## GPU validation record
 
-Every published kernel-performance change should record:
+A publication-grade kernel-performance record contains:
 
 - GPU name and compute capability;
 - CUDA, driver, PyTorch, and Triton versions;
 - dtype and tensor shape;
 - reference implementation and tolerances;
 - warmup/iteration count and timing method;
-- correctness result before latency numbers;
+- correctness results alongside latency numbers;
 - whether compilation/autotuning time was excluded.
 
-Do not silently treat a skipped GPU test as a pass. Hardware-gated results
-should be reported separately from the CPU suite.
+Skipped GPU tests are not passes. Hardware-gated results are reported
+separately from the CPU suite.
 
-## Consolidation roadmap
+## Current suite boundaries
 
-- Add pytest markers: `cpu`, `cuda`, `model`, `benchmark`, `remote`, `slow`.
-- Move standalone harness behavior behind marker-aware pytest entry points.
-- Publish one CPU CI command and separate scheduled GPU jobs.
-- Replace string/source-inspection regressions with behavioral assertions where
-  possible.
-- Store benchmark performance gates outside correctness tests.
+- The suite does not yet expose a complete marker taxonomy for `cpu`, `cuda`,
+  `model`, `benchmark`, `remote`, and `slow` cases.
+- Some standalone harness behavior remains outside marker-aware pytest entry
+  points.
+- CPU and hardware-specific GPU coverage do not currently share one CI matrix.
+- A subset of regressions inspect source strings where runtime behavior is not
+  safely available in the active environment.
+- Performance gates and correctness assertions coexist in a small number of
+  benchmark-oriented tests.

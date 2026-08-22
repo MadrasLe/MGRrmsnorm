@@ -40,5 +40,5 @@ Run shape:
 - All three comparisons are same-session paired, so the MicroGemm/llama.cpp ratios are much more trustworthy than cross-Colab comparisons.
 - Qwen2.5 0.5B and 1.5B both show MicroGemm ahead in wall/output, decode-only, and prefill.
 - Mistral 7B INT4 also shows a solid win against llama.cpp Q4_K_M, especially in decode.
-- The v135 `parallel_rope_kv_batch` patch does not matter much for these three dense models at this context length: `rope_kv` is now small. The next meaningful CPU optimization target is the quantized MLP dot path: `gate_up_dot`, followed by `down_proj_dot`.
-- The later cases were run after llama.cpp build/download activity and show high loadavg at case start. Because each case is still paired in the same session, the ratios remain useful, but repeat the matrix before publishing hard claims.
+- The v135 `parallel_rope_kv_batch` patch does not matter much for these three dense models at this context length: `rope_kv` is now small. The remaining profile is concentrated in the quantized MLP dot path: `gate_up_dot`, followed by `down_proj_dot`.
+- The later cases were run after llama.cpp build/download activity and show high loadavg at case start. Because each case is still paired in the same session, the ratios remain useful, but the load contamination limits hard publication claims.

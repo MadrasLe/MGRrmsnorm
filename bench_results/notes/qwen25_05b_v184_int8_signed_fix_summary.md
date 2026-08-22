@@ -50,9 +50,9 @@ Run shape:
 ## Notes
 
 - This run is the first same-session Qwen2.5 0.5B INT8 vs llama.cpp Q8_0 comparison after the v184 batched INT8 signed-input fix.
-- The old INT8 per-row comparison results before v184 should be treated as suspect because `microgemm_gemv_i8_batched` could feed prebiased activations into kernels that add `+128` internally.
+- INT8 per-row comparison results before v184 are invalidated by a path where `microgemm_gemv_i8_batched` could feed prebiased activations into kernels that add `+128` internally.
 - The v184 run is a stronger result than the older v135 Qwen2.5 0.5B INT8 vs Q8_0 note: wall ratio improved from 1.28x to 1.40x, decode from 1.41x to 1.51x, and prefill from 1.46x to 1.69x.
-- The next CPU optimization target remains the quantized MLP path, especially `gate_up_dot`, followed by `down_proj_dot`.
+- The profile is concentrated in the quantized MLP path: `gate_up_dot` is the largest recorded hotspot, followed by `down_proj_dot`.
 
 ## INT8G128 vs llama.cpp Q8_0 Same-Session Check
 

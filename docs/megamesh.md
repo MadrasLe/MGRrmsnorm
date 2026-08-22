@@ -10,8 +10,8 @@ It has two intended modes:
    cross the wire.
 2. **Layer-shard mode**: each worker owns a layer range and passes hidden states
    to the next stage. This is useful when one model does not fit on one GPU, but
-   it is much more sensitive to network latency. It should cross the network only
-   at coarse stage boundaries, not after every individual layer.
+   it is much more sensitive to network latency. Hidden states cross the network
+   at coarse stage boundaries rather than after every individual layer.
 
 ## Replica Quickstart
 
@@ -76,8 +76,8 @@ python benchmarks/benchmark_megamesh.py \
 Layer-shard mode is now available as an isolated proof-of-concept. It does not
 touch `InferenceEngine`, the normal scheduler, or the replica worker path.
 
-Use this when a model does not fit on one GPU and you want to prove that two
-separate T4 workers can own different layer ranges:
+This path demonstrates two separate T4 workers owning different layer ranges
+when a model does not fit on one GPU:
 
 ```bash
 MODEL="Qwen/Qwen2.5-14B-Instruct"
@@ -89,7 +89,7 @@ python -m megagemm mesh-plan \
   --devices cuda:0,cuda:1
 ```
 
-Start one process per GPU. On one Kaggle machine you can bind explicitly:
+One process runs per GPU. A single Kaggle machine can bind them explicitly:
 
 ```bash
 python -u -m megagemm mesh-shard-worker \
@@ -121,9 +121,9 @@ python -u -m megagemm mesh-shard-worker \
   --num-blocks 256
 ```
 
-If you prefer to treat each process as if it had only one GPU, use
-`CUDA_VISIBLE_DEVICES=0` for the first process and `CUDA_VISIBLE_DEVICES=1` for
-the second, then pass `--device cuda` to both.
+For process-local single-GPU visibility, the first process uses
+`CUDA_VISIBLE_DEVICES=0`, the second uses `CUDA_VISIBLE_DEVICES=1`, and both
+receive `--device cuda`.
 
 Generate through the ordered stages:
 
@@ -340,9 +340,9 @@ The final stage health reports:
 
 This is not a full tensor-parallel transformer block yet. It is a deliberately
 small proof that MegaMesh can isolate a sub-layer owner with its own weights,
-device, transport, and failure boundary. The next harder splits are MLP row/col
-shards and attention-head shards, because those need distributed reductions
-inside every transformer layer rather than one final argmax reduction.
+device, transport, and failure boundary. MLP row/column shards and attention-head
+shards are not implemented because they require distributed reductions inside
+every transformer layer rather than one final argmax reduction.
 
 ### Experimental MLP intermediate sharding
 
