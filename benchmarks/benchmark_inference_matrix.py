@@ -2164,19 +2164,23 @@ def run_matrix(args: argparse.Namespace) -> list[dict[str, Any]]:
                 )
         return rows
 
-    if args.warmup:
-        warm_prompts, _ = build_prompts(tokenizer, 1, min(prompt_token_lengths))
-        try:
-            print("Warmup")
-            runner(warm_prompts, min(8, args.max_new_tokens))
-        except Exception as exc:
-            print(f"  warmup failed: {type(exc).__name__}: {exc}")
-        cleanup_cuda()
-
     for prompt_tokens in prompt_token_lengths:
         for batch_size in batch_sizes:
             scenario = scenario_name(batch_size, prompt_tokens, args)
             prompts, prompt_tokens_actual = build_prompts(tokenizer, batch_size, prompt_tokens)
+            if args.warmup > 0:
+                for warmup_idx in range(args.warmup):
+                    cleanup_cuda()
+                    print(
+                        f"Warmup scenario={scenario} batch={batch_size} prompt_tokens={prompt_tokens} "
+                        f"repeat={warmup_idx + 1}/{args.warmup}"
+                    )
+                    try:
+                        runner(prompts, args.max_new_tokens)
+                    except Exception as exc:
+                        print(f"  warmup failed: {type(exc).__name__}: {exc}")
+                        break
+                cleanup_cuda()
             for repeat_idx in range(args.repeats):
                 cleanup_cuda()
                 print(
