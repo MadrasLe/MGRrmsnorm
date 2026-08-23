@@ -225,8 +225,6 @@ Issues and documentation use these labels:
 - **Harness:** validation/benchmark tooling, not runtime API.
 - **Archived result:** dated evidence retained for historical comparison.
 
-The package metadata intentionally uses `Development Status :: 3 - Alpha`.
-This reflects breadth and rapid development, not a lack of technical depth.
 
 ## Current structural boundaries
 
