@@ -65,6 +65,7 @@ GEMMA4_DENSE_FAST_PROFILE = {
     "MEGAGEMM_FAST_GEMV": "1",
     "MEGAGEMM_DEEPFUSION_MLP": "1",
     "MEGAGEMM_GEMMA4_FUSED_QKV_DECODE": "1",
+    "MEGAGEMM_GEMMA4_DENSE_L4_DECODE_GRAPHS": "1",
     "MEGAGEMM_GEMMA4_FUSED_GATEUP_DECODE": "1",
     "MEGAGEMM_GEMMA4_DEEPFUSION_MLP_DECODE": "1",
     "MEGAGEMM_FUSED_LM_HEAD_ARGMAX_DECODE": "1",
@@ -157,6 +158,8 @@ def command_for(
     run_dir: Path,
     run_id: str,
     warmup: int,
+    max_seq_len: int,
+    megagemm_profile: str,
 ) -> list[str]:
     command = [
         sys.executable,
@@ -186,13 +189,20 @@ def command_for(
         "--dtype",
         variant.dtype,
         "--max-seq-len",
-        str(args.max_seq_len),
+        str(max_seq_len),
         "--max-batch-size",
         str(args.max_batch_size),
         "--ignore-eos",
     ]
     if variant.quantize:
         command.extend(["--quantize", variant.quantize])
+    if variant.backend == "megagemm" and megagemm_profile == "gemma4-dense-fast":
+        command.extend(
+            [
+                "--megagemm-verify-decode-graph",
+                "--megagemm-reset-scheduler-between-scenarios",
+            ]
+        )
     if variant.backend == "vllm":
         command.extend(
             [
@@ -201,7 +211,7 @@ def command_for(
                 "--vllm-gpu-memory-utilization",
                 str(args.vllm_gpu_memory_utilization),
                 "--vllm-max-model-len",
-                str(args.max_seq_len),
+                str(max_seq_len),
                 "--vllm-disable-prefix-caching",
             ]
         )
@@ -253,6 +263,7 @@ def audit_gemma4_dense_fast_path(path: Path) -> dict:
         if line.strip()
     ]
     successful = [row for row in rows if row.get("ok")]
+    failed = [row for row in rows if not row.get("ok")]
     if not successful:
         return {
             "status": "failed",
@@ -281,8 +292,26 @@ def audit_gemma4_dense_fast_path(path: Path) -> dict:
         for item in decode_stats
         if isinstance(item.get("paged_decode_runtime"), dict)
     ]
+    graph_preflights = [
+        row.get("megagemm_decode_graph_preflight")
+        for row in successful
+        if isinstance(row.get("megagemm_decode_graph_preflight"), dict)
+    ]
 
     errors: list[str] = []
+    if failed:
+        failure_kinds = sorted(
+            {str(row.get("error") or "unknown benchmark failure") for row in failed}
+        )
+        errors.append(
+            f"{len(failed)} benchmark row(s) failed: " + "; ".join(failure_kinds)
+        )
+    if len(graph_preflights) != len(successful):
+        errors.append("decode graph token-equivalence preflight missing")
+    if graph_preflights and not all(
+        item.get("status") == "passed" for item in graph_preflights
+    ):
+        errors.append("decode graph token-equivalence preflight failed")
     if len(decode_stats) != len(successful):
         errors.append("decode_runtime_stats missing from one or more rows")
     if decode_stats and not all(item.get("flat_decode_ready") for item in decode_stats):
@@ -321,6 +350,8 @@ def audit_gemma4_dense_fast_path(path: Path) -> dict:
         "status": "failed" if errors else "passed",
         "raw_jsonl": str(path),
         "successful_rows": len(successful),
+        "failed_rows": len(failed),
+        "decode_graph_preflight": graph_preflights[0] if graph_preflights else None,
         "required": {
             "flat_decode_ready": bool(
                 decode_stats and all(item.get("flat_decode_ready") for item in decode_stats)
@@ -450,6 +481,23 @@ def main() -> int:
     variants = parse_variants(args.variants)
     megagemm_profile = resolve_megagemm_profile(args.megagemm_profile, args.model)
     effective_warmup = max(args.warmup, 3) if megagemm_profile != "none" else args.warmup
+    effective_max_seq_len = args.max_seq_len
+    if megagemm_profile == "gemma4-dense-fast":
+        max_prompt_tokens = max(
+            int(part.strip())
+            for part in args.prompt_tokens.split(",")
+            if part.strip()
+        )
+        # Chat templates add a few tokens beyond the requested prompt length.
+        # Keep a bounded safety margin, then align the KV capacity to 256 tokens.
+        workload_capacity = max_prompt_tokens + args.max_new_tokens + 64
+        workload_capacity = ((workload_capacity + 255) // 256) * 256
+        if args.max_seq_len < workload_capacity:
+            raise SystemExit(
+                f"--max-seq-len={args.max_seq_len} is too small for this workload; "
+                f"need at least {workload_capacity}"
+            )
+        effective_max_seq_len = min(args.max_seq_len, workload_capacity)
     hardware_label = args.hardware_label or auto_hardware_label()
     run_id = args.run_id or f"publication_{time.strftime('%Y%m%d_%H%M%S')}"
     run_dir = Path(args.out_dir)
@@ -465,6 +513,8 @@ def main() -> int:
             run_dir=run_dir,
             run_id=run_id,
             warmup=effective_warmup,
+            max_seq_len=effective_max_seq_len,
+            megagemm_profile=megagemm_profile,
         )
         for variant in variants
     ]
@@ -475,6 +525,7 @@ def main() -> int:
     print(f"  variants: {', '.join(variant.name for variant in variants)}")
     print(f"  MegaGemm profile: {megagemm_profile}")
     print(f"  warmups: {effective_warmup}")
+    print(f"  effective max sequence: {effective_max_seq_len}")
     print(f"  output:   {run_dir}")
     for command in commands:
         print(f"\n{shell_join(command)}")
@@ -491,6 +542,7 @@ def main() -> int:
         "megagemm_profile": megagemm_profile,
         "megagemm_profile_env": MEGAGEMM_PROFILES[megagemm_profile],
         "effective_warmup": effective_warmup,
+        "effective_max_seq_len": effective_max_seq_len,
         "fastpath_audits": {},
         "args": vars(args),
         "commands": commands,

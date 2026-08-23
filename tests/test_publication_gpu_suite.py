@@ -81,6 +81,19 @@ def test_fast_path_audit_proves_runtime_and_reports_selected_kernels(tmp_path):
                 "request_scheduler_reuse_count": 3,
             }
         },
+        "megagemm_decode_graph_preflight": {
+            "status": "passed",
+            "cases": [
+                {
+                    "batch_size": 1,
+                    "token_exact": True,
+                    "captures": 1,
+                    "replays": 5,
+                    "failures": 0,
+                }
+            ],
+            "errors": [],
+        },
     }
     raw_path.write_text(json.dumps(row) + "\n", encoding="utf-8")
 
@@ -113,6 +126,11 @@ def test_fast_path_audit_rejects_eager_fallback(tmp_path):
                 "failures": 1,
                 "last_failure": "capture failed",
             }
+        },
+        "megagemm_decode_graph_preflight": {
+            "status": "failed",
+            "cases": [],
+            "errors": ["capture failed"],
         },
     }
     raw_path.write_text(json.dumps(row) + "\n", encoding="utf-8")

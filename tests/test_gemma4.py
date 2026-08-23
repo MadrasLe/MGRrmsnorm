@@ -1911,6 +1911,59 @@ def test_gemma4_a4b_decode_graph_policy_is_exact():
     )
 
 
+def test_gemma4_dense_l4_decode_graph_policy_is_opt_in_and_exact():
+    from megagemm.models.llama import _gemma4_dense_l4_decode_graph_shape
+
+    class E4BConfig:
+        model_type = "gemma4_text"
+        enable_moe_block = False
+        hidden_size = 2560
+        num_hidden_layers = 42
+        num_key_value_heads = 2
+        num_kv_shared_layers = 18
+        layer_types = ["sliding_attention"] * 35 + ["full_attention"] * 7
+
+    kwargs = {
+        "num_seqs": 8,
+        "dtype": torch.bfloat16,
+        "device_type": "cuda",
+        "device_name": "NVIDIA L4",
+    }
+    with mock.patch.dict(
+        "os.environ",
+        {"MEGAGEMM_GEMMA4_DENSE_L4_DECODE_GRAPHS": "0"},
+    ):
+        assert not _gemma4_dense_l4_decode_graph_shape(E4BConfig(), **kwargs)
+
+    with mock.patch.dict(
+        "os.environ",
+        {"MEGAGEMM_GEMMA4_DENSE_L4_DECODE_GRAPHS": "1"},
+    ):
+        assert _gemma4_dense_l4_decode_graph_shape(E4BConfig(), **kwargs)
+        assert not _gemma4_dense_l4_decode_graph_shape(
+            E4BConfig(), **{**kwargs, "num_seqs": 16}
+        )
+        assert not _gemma4_dense_l4_decode_graph_shape(
+            E4BConfig(), **{**kwargs, "dtype": torch.float16}
+        )
+        assert not _gemma4_dense_l4_decode_graph_shape(
+            E4BConfig(), **{**kwargs, "device_name": "Tesla T4"}
+        )
+
+        class E2BConfig:
+            model_type = "gemma4_text"
+            enable_moe_block = False
+            hidden_size = 1536
+            num_hidden_layers = 35
+            num_key_value_heads = 1
+            num_kv_shared_layers = 20
+            layer_types = ["sliding_attention"] * 28 + ["full_attention"] * 7
+
+        assert _gemma4_dense_l4_decode_graph_shape(
+            E2BConfig(), **{**kwargs, "num_seqs": 1}
+        )
+
+
 def test_gemma4_batch_prefill_selects_native_padded_path():
     from megagemm.engine.scheduler import Scheduler
 
