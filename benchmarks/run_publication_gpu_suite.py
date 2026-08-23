@@ -140,6 +140,15 @@ def command_for(
                 "--vllm-disable-prefix-caching",
             ]
         )
+        if args.vllm_max_num_seqs > 0:
+            command.extend(["--vllm-max-num-seqs", str(args.vllm_max_num_seqs)])
+        if args.vllm_max_num_batched_tokens > 0:
+            command.extend(
+                [
+                    "--vllm-max-num-batched-tokens",
+                    str(args.vllm_max_num_batched_tokens),
+                ]
+            )
         if args.vllm_language_model_only:
             command.append("--vllm-language-model-only")
         if args.vllm_enforce_eager:
@@ -180,6 +189,8 @@ def main() -> int:
     parser.add_argument("--max-seq-len", type=int, default=4096)
     parser.add_argument("--max-batch-size", type=int, default=8)
     parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.90)
+    parser.add_argument("--vllm-max-num-seqs", type=int, default=0)
+    parser.add_argument("--vllm-max-num-batched-tokens", type=int, default=0)
     parser.add_argument("--vllm-language-model-only", action="store_true")
     parser.add_argument("--vllm-enforce-eager", action="store_true")
     parser.add_argument("--out-dir", default="bench_results/publication_gpu")

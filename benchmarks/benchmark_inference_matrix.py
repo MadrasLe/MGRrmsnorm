@@ -1936,6 +1936,10 @@ def load_vllm_runner(args: argparse.Namespace, tokenizer):
         "enable_prefix_caching": not args.vllm_disable_prefix_caching,
         "disable_log_stats": True,
     }
+    if args.vllm_max_num_seqs > 0:
+        llm_kwargs["max_num_seqs"] = args.vllm_max_num_seqs
+    if args.vllm_max_num_batched_tokens > 0:
+        llm_kwargs["max_num_batched_tokens"] = args.vllm_max_num_batched_tokens
     if args.vllm_language_model_only:
         llm_kwargs["language_model_only"] = True
     if args.tokenizer:
@@ -1997,6 +2001,8 @@ def load_vllm_runner(args: argparse.Namespace, tokenizer):
                     "tensor_parallel_size": args.vllm_tensor_parallel_size,
                     "gpu_memory_utilization": args.vllm_gpu_memory_utilization,
                     "max_model_len": args.vllm_max_model_len or args.max_seq_len,
+                    "max_num_seqs": args.vllm_max_num_seqs or None,
+                    "max_num_batched_tokens": args.vllm_max_num_batched_tokens or None,
                     "enforce_eager": args.vllm_enforce_eager,
                     "prefix_caching": not args.vllm_disable_prefix_caching,
                     "cudagraph_memory_profiler": not args.vllm_disable_cudagraph_memory_profiler,
@@ -2400,6 +2406,18 @@ def main() -> int:
     parser.add_argument("--vllm-tensor-parallel-size", type=int, default=1)
     parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.90)
     parser.add_argument("--vllm-max-model-len", type=int, default=0, help="0 means use --max-seq-len")
+    parser.add_argument(
+        "--vllm-max-num-seqs",
+        type=int,
+        default=0,
+        help="Maximum scheduler sequences; 0 keeps the vLLM default.",
+    )
+    parser.add_argument(
+        "--vllm-max-num-batched-tokens",
+        type=int,
+        default=0,
+        help="Maximum scheduler tokens per iteration; 0 keeps the vLLM default.",
+    )
     parser.add_argument("--vllm-enforce-eager", action="store_true")
     parser.add_argument("--vllm-language-model-only", action="store_true")
     parser.add_argument("--vllm-disable-prefix-caching", action="store_true")
