@@ -1871,8 +1871,16 @@ def _preload_vllm_cuda13_runtime() -> tuple[str | None, str]:
     patterns = (
         "nvidia/cuda_runtime/lib/libcudart.so.13*",
         "nvidia/cuda_runtime/lib64/libcudart.so.13*",
+        # New CUDA 13 runtime wheels use layouts such as
+        # site-packages/nvidia/cu13/lib/libcudart.so.13.
+        "nvidia/**/libcudart.so.13*",
+        "nvidia/**/lib/libcudart.so.13*",
+        "nvidia/**/lib64/libcudart.so.13*",
         "nvidia/cuda_runtime/lib/libcudart.so*",
         "nvidia/cuda_runtime/lib64/libcudart.so*",
+        "nvidia/**/libcudart.so*",
+        "nvidia/**/lib/libcudart.so*",
+        "nvidia/**/lib64/libcudart.so*",
     )
     for root in _python_lib_roots():
         for pattern in patterns:
