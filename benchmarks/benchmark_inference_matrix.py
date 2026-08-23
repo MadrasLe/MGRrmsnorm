@@ -417,6 +417,12 @@ def verify_megagemm_decode_graph(
     """Require token-exact eager/graph decode and observed capture/replay."""
     previous_graph = os.environ.get("MEGAGEMM_DECODE_CUDA_GRAPHS")
     previous_reuse = os.environ.get("MEGAGEMM_REUSE_REQUEST_SCHEDULER")
+    previous_prefer_step = os.environ.get(
+        "MEGAGEMM_DECODE_CUDA_GRAPHS_PREFER_STEP"
+    )
+    previous_dense_graph = os.environ.get(
+        "MEGAGEMM_GEMMA4_DENSE_L4_DECODE_GRAPHS"
+    )
     cases: list[dict[str, Any]] = []
     errors: list[str] = []
     try:
@@ -425,7 +431,13 @@ def verify_megagemm_decode_graph(
 
             engine._last_scheduler = None
             cleanup_cuda()
-            os.environ["MEGAGEMM_DECODE_CUDA_GRAPHS"] = "0"
+            # Keep prefer-step scheduling identical to the graph run, but make
+            # the model eligibility gate return false.  Setting the scheduler's
+            # graph flag to zero would route greedy decode through decode_multi_step
+            # and compare two different execution paths.
+            os.environ["MEGAGEMM_DECODE_CUDA_GRAPHS"] = "1"
+            os.environ["MEGAGEMM_DECODE_CUDA_GRAPHS_PREFER_STEP"] = "1"
+            os.environ["MEGAGEMM_GEMMA4_DENSE_L4_DECODE_GRAPHS"] = "0"
             os.environ["MEGAGEMM_REUSE_REQUEST_SCHEDULER"] = "0"
             engine.generate_batch(
                 prompts,
@@ -442,6 +454,8 @@ def verify_megagemm_decode_graph(
             engine._last_scheduler = None
             cleanup_cuda()
             os.environ["MEGAGEMM_DECODE_CUDA_GRAPHS"] = "1"
+            os.environ["MEGAGEMM_DECODE_CUDA_GRAPHS_PREFER_STEP"] = "1"
+            os.environ["MEGAGEMM_GEMMA4_DENSE_L4_DECODE_GRAPHS"] = "1"
             os.environ["MEGAGEMM_REUSE_REQUEST_SCHEDULER"] = "1"
             engine.generate_batch(
                 prompts,
@@ -493,6 +507,18 @@ def verify_megagemm_decode_graph(
             os.environ.pop("MEGAGEMM_REUSE_REQUEST_SCHEDULER", None)
         else:
             os.environ["MEGAGEMM_REUSE_REQUEST_SCHEDULER"] = previous_reuse
+        if previous_prefer_step is None:
+            os.environ.pop("MEGAGEMM_DECODE_CUDA_GRAPHS_PREFER_STEP", None)
+        else:
+            os.environ[
+                "MEGAGEMM_DECODE_CUDA_GRAPHS_PREFER_STEP"
+            ] = previous_prefer_step
+        if previous_dense_graph is None:
+            os.environ.pop("MEGAGEMM_GEMMA4_DENSE_L4_DECODE_GRAPHS", None)
+        else:
+            os.environ[
+                "MEGAGEMM_GEMMA4_DENSE_L4_DECODE_GRAPHS"
+            ] = previous_dense_graph
 
     report = {
         "status": "failed" if errors else "passed",

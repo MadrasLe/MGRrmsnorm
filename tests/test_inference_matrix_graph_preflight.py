@@ -50,7 +50,10 @@ class FakeEngine:
 
     def generate_batch(self, prompts, *, max_new_tokens, **kwargs):
         del kwargs
-        graph_enabled = os.environ.get("MEGAGEMM_DECODE_CUDA_GRAPHS") == "1"
+        graph_enabled = (
+            os.environ.get("MEGAGEMM_DECODE_CUDA_GRAPHS") == "1"
+            and os.environ.get("MEGAGEMM_GEMMA4_DENSE_L4_DECODE_GRAPHS") == "1"
+        )
         completed = []
         for index, _prompt in enumerate(prompts, start=1):
             tokens = list(range(max_new_tokens))
