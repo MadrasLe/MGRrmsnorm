@@ -390,156 +390,7 @@ def megagemm_diagnostics(engine) -> dict[str, Any]:
                 diagnostics["last_decode_timing"] = last_timing
         except Exception as exc:
             diagnostics["last_decode_timing_error"] = str(exc)
-    graph_preflight = getattr(engine, "_megagemm_decode_graph_preflight", None)
-    if isinstance(graph_preflight, dict):
-        diagnostics["megagemm_decode_graph_preflight"] = graph_preflight
     return diagnostics
-
-
-def _completed_token_rows(engine, expected_tokens: int) -> list[list[int]]:
-    scheduler = getattr(engine, "_last_scheduler", None)
-    completed = list(getattr(scheduler, "_completed", ()) or ())
-    completed.sort(key=lambda request: int(request.request_id))
-    return [
-        [int(token) for token in request.generated_ids[-expected_tokens:]]
-        for request in completed
-    ]
-
-
-def verify_megagemm_decode_graph(
-    engine,
-    tokenizer,
-    *,
-    batch_sizes: list[int],
-    prompt_tokens: int = 32,
-    max_new_tokens: int = 8,
-) -> dict[str, Any]:
-    """Require token-exact eager/graph decode and observed capture/replay."""
-    previous_graph = os.environ.get("MEGAGEMM_DECODE_CUDA_GRAPHS")
-    previous_reuse = os.environ.get("MEGAGEMM_REUSE_REQUEST_SCHEDULER")
-    previous_prefer_step = os.environ.get(
-        "MEGAGEMM_DECODE_CUDA_GRAPHS_PREFER_STEP"
-    )
-    previous_dense_graph = os.environ.get(
-        "MEGAGEMM_GEMMA4_DENSE_L4_DECODE_GRAPHS"
-    )
-    cases: list[dict[str, Any]] = []
-    errors: list[str] = []
-    try:
-        for batch_size in sorted(set(int(size) for size in batch_sizes)):
-            prompts, _ = build_prompts(tokenizer, batch_size, prompt_tokens)
-
-            engine._last_scheduler = None
-            cleanup_cuda()
-            # Keep prefer-step scheduling identical to the graph run, but make
-            # the model eligibility gate return false.  Setting the scheduler's
-            # graph flag to zero would route greedy decode through decode_multi_step
-            # and compare two different execution paths.
-            os.environ["MEGAGEMM_DECODE_CUDA_GRAPHS"] = "1"
-            os.environ["MEGAGEMM_DECODE_CUDA_GRAPHS_PREFER_STEP"] = "1"
-            os.environ["MEGAGEMM_GEMMA4_DENSE_L4_DECODE_GRAPHS"] = "0"
-            os.environ["MEGAGEMM_REUSE_REQUEST_SCHEDULER"] = "0"
-            engine.generate_batch(
-                prompts,
-                max_new_tokens=max_new_tokens,
-                temperature=0.0,
-                top_k=0,
-                top_p=1.0,
-                ignore_eos=True,
-                decode_outputs=False,
-                materialize_generated_tokens=True,
-            )
-            eager_tokens = _completed_token_rows(engine, max_new_tokens)
-
-            engine._last_scheduler = None
-            cleanup_cuda()
-            os.environ["MEGAGEMM_DECODE_CUDA_GRAPHS"] = "1"
-            os.environ["MEGAGEMM_DECODE_CUDA_GRAPHS_PREFER_STEP"] = "1"
-            os.environ["MEGAGEMM_GEMMA4_DENSE_L4_DECODE_GRAPHS"] = "1"
-            os.environ["MEGAGEMM_REUSE_REQUEST_SCHEDULER"] = "1"
-            engine.generate_batch(
-                prompts,
-                max_new_tokens=max_new_tokens,
-                temperature=0.0,
-                top_k=0,
-                top_p=1.0,
-                ignore_eos=True,
-                decode_outputs=False,
-                materialize_generated_tokens=True,
-            )
-            graph_tokens = _completed_token_rows(engine, max_new_tokens)
-            scheduler = getattr(engine, "_last_scheduler", None)
-            scheduler_stats = scheduler.get_stats() if scheduler is not None else {}
-            graph_stats = dict(scheduler_stats.get("decode_cuda_graphs") or {})
-            exact = bool(eager_tokens and eager_tokens == graph_tokens)
-            captures = int(graph_stats.get("captures", 0) or 0)
-            replays = int(graph_stats.get("replays", 0) or 0)
-            failures = int(graph_stats.get("failures", 0) or 0)
-            case = {
-                "batch_size": batch_size,
-                "prompt_tokens": prompt_tokens,
-                "max_new_tokens": max_new_tokens,
-                "token_exact": exact,
-                "captures": captures,
-                "replays": replays,
-                "failures": failures,
-                "last_failure": str(graph_stats.get("last_failure") or ""),
-            }
-            cases.append(case)
-            if not exact:
-                errors.append(f"batch={batch_size}: eager/graph token mismatch")
-            if captures <= 0 or replays <= 0:
-                errors.append(
-                    f"batch={batch_size}: no active capture/replay "
-                    f"(captures={captures}, replays={replays})"
-                )
-            if failures > 0:
-                errors.append(
-                    f"batch={batch_size}: {failures} graph failure(s): "
-                    f"{case['last_failure'] or 'unspecified'}"
-                )
-    finally:
-        if previous_graph is None:
-            os.environ.pop("MEGAGEMM_DECODE_CUDA_GRAPHS", None)
-        else:
-            os.environ["MEGAGEMM_DECODE_CUDA_GRAPHS"] = previous_graph
-        if previous_reuse is None:
-            os.environ.pop("MEGAGEMM_REUSE_REQUEST_SCHEDULER", None)
-        else:
-            os.environ["MEGAGEMM_REUSE_REQUEST_SCHEDULER"] = previous_reuse
-        if previous_prefer_step is None:
-            os.environ.pop("MEGAGEMM_DECODE_CUDA_GRAPHS_PREFER_STEP", None)
-        else:
-            os.environ[
-                "MEGAGEMM_DECODE_CUDA_GRAPHS_PREFER_STEP"
-            ] = previous_prefer_step
-        if previous_dense_graph is None:
-            os.environ.pop("MEGAGEMM_GEMMA4_DENSE_L4_DECODE_GRAPHS", None)
-        else:
-            os.environ[
-                "MEGAGEMM_GEMMA4_DENSE_L4_DECODE_GRAPHS"
-            ] = previous_dense_graph
-
-    report = {
-        "status": "failed" if errors else "passed",
-        "cases": cases,
-        "errors": errors,
-    }
-    engine._megagemm_decode_graph_preflight = report
-    if errors:
-        raise RuntimeError(
-            "MegaGemm decode graph preflight failed: " + " | ".join(errors)
-        )
-    print(
-        "[MegaGemm] Dense Gemma 4 decode graph preflight: PASS "
-        + ", ".join(
-            f"B{case['batch_size']} captures={case['captures']} "
-            f"replays={case['replays']} exact=1"
-            for case in cases
-        ),
-        flush=True,
-    )
-    return report
 
 
 def metric_row(
@@ -853,13 +704,6 @@ def load_megagemm_runner(args: argparse.Namespace, tokenizer):
         mgx_payload_cache_dir=args.mgx_payload_cache_dir,
     )
 
-    if args.megagemm_verify_decode_graph:
-        verify_megagemm_decode_graph(
-            engine,
-            tokenizer,
-            batch_sizes=parse_csv_ints(args.batch_sizes),
-        )
-
     def run(prompts: list[str], max_new_tokens: int) -> dict[str, Any]:
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
@@ -892,15 +736,6 @@ def load_megagemm_runner(args: argparse.Namespace, tokenizer):
                 **megagemm_diagnostics(engine),
             },
         }
-
-    if args.megagemm_reset_scheduler_between_scenarios:
-        def reset_scenario() -> None:
-            # Graph pools are shape-specific.  Keep reuse within a scenario,
-            # but release the previous context shape before the next prefill.
-            engine._last_scheduler = None
-            cleanup_cuda()
-
-        run.reset_scenario = reset_scenario
 
     return run
 
@@ -2526,17 +2361,6 @@ def main() -> int:
     parser.add_argument("--gpu-window", type=int, default=64)
     parser.add_argument("--mgx-prefer-payload-cache", action="store_true")
     parser.add_argument("--mgx-payload-cache-dir")
-    parser.add_argument(
-        "--megagemm-verify-decode-graph",
-        action="store_true",
-        help="Require token-exact eager/graph preflight with observed capture and replay.",
-    )
-    parser.add_argument(
-        "--megagemm-reset-scheduler-between-scenarios",
-        action="store_true",
-        help="Release shape-specific decode graph pools between matrix scenarios.",
-    )
-
     parser.add_argument("--prophet-dir", default="", help="Prophet library directory for megagemm-prophet")
     parser.add_argument("--prophet-reset-dir", action="store_true")
     parser.add_argument(

@@ -235,6 +235,14 @@ class Scheduler:
             "MEGAGEMM_DECODE_SKIP_TOKEN_STORE", default=False
         )
         self._decode_multi_step_burst = _get_batch_decode_burst()
+        # Select the regular one-token decode path independently from CUDA
+        # Graphs.  Some model/GPU combinations are faster in the flat
+        # decode_step path even when graph capture is intentionally disabled.
+        self._decode_prefer_step = _env_bool(
+            "MEGAGEMM_DECODE_PREFER_STEP", default=False,
+        )
+        self._decode_step_batches = 0
+        self._decode_multi_step_batches = 0
         self._decode_graph_token_burst = _env_bool(
             "MEGAGEMM_DECODE_GRAPH_TOKEN_BURST", default=True,
         )
@@ -660,6 +668,7 @@ class Scheduler:
                 self._decode_cuda_graphs
                 and self._decode_cuda_graph_prefer_step
             )
+            prefer_decode_step = self._decode_prefer_step or prefer_graph_step
             use_graph_token_burst = bool(
                 all_greedy
                 and no_pending
@@ -674,9 +683,11 @@ class Scheduler:
                 finished = self._decode_graph_token_burst_batch(
                     self._decode_multi_step_burst,
                 )
-            elif all_greedy and has_multi_step and no_pending and not prefer_graph_step:
+            elif all_greedy and has_multi_step and no_pending and not prefer_decode_step:
+                self._decode_multi_step_batches += 1
                 finished = self._decode_multi_step_batch(self._decode_multi_step_burst)
             else:
+                self._decode_step_batches += 1
                 finished = self._decode_batch()
             self._decode_time += time.perf_counter() - t0
             newly_completed.extend(finished)
@@ -2746,6 +2757,11 @@ class Scheduler:
         stats['prefill_time_ms'] = self._prefill_time * 1000
         stats['decode_time_ms'] = self._decode_time * 1000
         stats['benchmark_forced_token_id'] = self._benchmark_forced_token_id
+        stats['decode_execution'] = {
+            'prefer_step': bool(self._decode_prefer_step),
+            'decode_step_batches': int(self._decode_step_batches),
+            'multi_step_batches': int(self._decode_multi_step_batches),
+        }
         if self._prefill_last_chunk_plan is not None:
             stats['prefill_chunk_plan'] = dict(self._prefill_last_chunk_plan)
         if self._prefill_stage_timing_totals:

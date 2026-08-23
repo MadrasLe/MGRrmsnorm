@@ -44,35 +44,29 @@ VARIANTS = {
 }
 
 
-# Conservative dense Gemma 4 profile.  It deliberately excludes the A100/A4B
-# MoE-only switches and the unproven L4 GQA2 override.  Shape-dependent kernels
-# still keep their internal correctness/performance gates; the audit emitted by
-# this runner records which of those gates actually promoted a fast path.
+# Conservative dense Gemma 4 eager profile.  It deliberately excludes the
+# A100/A4B MoE-only switches, CUDA Graph capture, and the unproven L4 GQA2
+# override.  Shape-dependent kernels keep their own correctness/performance
+# gates; the audit records which gates actually promoted a fast path.
 GEMMA4_DENSE_FAST_PROFILE = {
-    # Runtime topology and stable decode graph lifecycle.
-    "MEGAGEMM_FP16_STREAMING": "1",
+    # Runtime topology.  CUDA Graphs are explicitly disabled: the dense L4
+    # graph path is not token-exact, and the measured speedup came from flat
+    # eager decode rather than graph replay.
     "MEGAGEMM_FLAT_DECODE": "1",
-    "MEGAGEMM_DISABLE_CUDA_RMSNORM": "1",
-    "MEGAGEMM_DECODE_CUDA_GRAPHS": "1",
-    "MEGAGEMM_DECODE_CUDA_GRAPHS_PREFER_STEP": "1",
-    "MEGAGEMM_DECODE_CUDA_GRAPHS_SHAPE_CACHE": "1",
-    "MEGAGEMM_DECODE_CUDA_GRAPHS_SHARED_SHAPE_CACHE": "0",
+    "MEGAGEMM_DISABLE_CUDA_RMSNORM": "0",
+    "MEGAGEMM_DECODE_CUDA_GRAPHS": "0",
+    "MEGAGEMM_DECODE_CUDA_GRAPHS_PREFER_STEP": "0",
     "MEGAGEMM_REUSE_REQUEST_SCHEDULER": "1",
-    "MEGAGEMM_DECODE_CUDA_GRAPHS_STABLE_MAX_BLOCKS": "1",
-    "MEGAGEMM_DECODE_GRAPH_TOKEN_BURST": "0",
     # Dense decode kernels and fused tails.
     "MEGAGEMM_FUSED_ROPE_ATTN": "1",
     "MEGAGEMM_FAST_GEMV": "1",
     "MEGAGEMM_DEEPFUSION_MLP": "1",
     "MEGAGEMM_GEMMA4_FUSED_QKV_DECODE": "1",
-    "MEGAGEMM_GEMMA4_DENSE_L4_DECODE_GRAPHS": "1",
     "MEGAGEMM_GEMMA4_FUSED_GATEUP_DECODE": "1",
     "MEGAGEMM_GEMMA4_DEEPFUSION_MLP_DECODE": "1",
     "MEGAGEMM_FUSED_LM_HEAD_ARGMAX_DECODE": "1",
     "MEGAGEMM_FUSED_RMSNORM_LM_HEAD_ARGMAX_DECODE": "1",
     # Dense prefill paths.  Their shape gates remain authoritative.
-    "MEGAGEMM_GEMMA4_FUSED_QKV_PREFILL": "1",
-    "MEGAGEMM_GEMMA4_FUSED_ATTN_PREP_PREFILL": "1",
     "MEGAGEMM_GEMMA4_IMPLICIT_CAUSAL_PREFILL": "1",
     "MEGAGEMM_GEMMA4_LONG_SLIDING_PREFILL": "1",
     "MEGAGEMM_GEMMA4_LONG_FULL_PREFILL": "1",
@@ -80,7 +74,6 @@ GEMMA4_DENSE_FAST_PROFILE = {
     "MEGAGEMM_GEMMA4_FUSED_DUAL_FFN_NORM_PREFILL": "1",
     "MEGAGEMM_GEMMA4_FUSED_ADD_FFN_NORM_PREFILL": "1",
     "MEGAGEMM_GEMMA4_FUSED_POST_FFN_NORMS_PREFILL": "1",
-    "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
 }
 
 
@@ -101,10 +94,29 @@ def resolve_megagemm_profile(requested: str, model: str) -> str:
     return "none"
 
 
-def child_environment(variant: Variant, profile: str) -> dict[str, str]:
+def profile_environment(profile: str, model: str) -> dict[str, str]:
+    env = dict(MEGAGEMM_PROFILES[profile])
+    if profile == "gemma4-dense-fast":
+        # E4B's decode_multi_step route is currently much slower than its flat
+        # decode_step route.  E2B keeps the already-fast multi-step scheduler.
+        env["MEGAGEMM_DECODE_PREFER_STEP"] = (
+            "1" if "e4b" in model.lower() else "0"
+        )
+    return env
+
+
+def child_environment(
+    variant: Variant,
+    profile: str,
+    model: str,
+) -> dict[str, str]:
     env = os.environ.copy()
     if variant.backend == "megagemm":
-        env.update(MEGAGEMM_PROFILES[profile])
+        if profile == "gemma4-dense-fast":
+            # Deterministic cuBLAS workspaces were copied from a separate A100
+            # validation harness and are not part of the dense L4 speed path.
+            env.pop("CUBLAS_WORKSPACE_CONFIG", None)
+        env.update(profile_environment(profile, model))
     return env
 
 
@@ -196,13 +208,6 @@ def command_for(
     ]
     if variant.quantize:
         command.extend(["--quantize", variant.quantize])
-    if variant.backend == "megagemm" and megagemm_profile == "gemma4-dense-fast":
-        command.extend(
-            [
-                "--megagemm-verify-decode-graph",
-                "--megagemm-reset-scheduler-between-scenarios",
-            ]
-        )
     if variant.backend == "vllm":
         command.extend(
             [
@@ -255,7 +260,7 @@ def _max_counter(stats: list[dict], key: str) -> int:
     return max((int(item.get(key, 0) or 0) for item in stats), default=0)
 
 
-def audit_gemma4_dense_fast_path(path: Path) -> dict:
+def audit_gemma4_dense_fast_path(path: Path, model: str) -> dict:
     """Prove that the required fast runtime was used, then report gated kernels."""
     rows = [
         json.loads(line)
@@ -287,16 +292,17 @@ def audit_gemma4_dense_fast_path(path: Path) -> dict:
         for item in scheduler_stats
         if isinstance(item.get("decode_cuda_graphs"), dict)
     ]
+    execution_stats = [
+        item.get("decode_execution")
+        for item in scheduler_stats
+        if isinstance(item.get("decode_execution"), dict)
+    ]
     paged_stats = [
         item.get("paged_decode_runtime")
         for item in decode_stats
         if isinstance(item.get("paged_decode_runtime"), dict)
     ]
-    graph_preflights = [
-        row.get("megagemm_decode_graph_preflight")
-        for row in successful
-        if isinstance(row.get("megagemm_decode_graph_preflight"), dict)
-    ]
+    prefer_step = "e4b" in model.lower()
 
     errors: list[str] = []
     if failed:
@@ -306,12 +312,6 @@ def audit_gemma4_dense_fast_path(path: Path) -> dict:
         errors.append(
             f"{len(failed)} benchmark row(s) failed: " + "; ".join(failure_kinds)
         )
-    if len(graph_preflights) != len(successful):
-        errors.append("decode graph token-equivalence preflight missing")
-    if graph_preflights and not all(
-        item.get("status") == "passed" for item in graph_preflights
-    ):
-        errors.append("decode graph token-equivalence preflight failed")
     if len(decode_stats) != len(successful):
         errors.append("decode_runtime_stats missing from one or more rows")
     if decode_stats and not all(item.get("flat_decode_ready") for item in decode_stats):
@@ -327,12 +327,15 @@ def audit_gemma4_dense_fast_path(path: Path) -> dict:
         errors.append("flat decode reported a runtime failure")
     if len(graph_stats) != len(successful):
         errors.append("decode_cuda_graphs stats missing from one or more rows")
-    if graph_stats and not all(item.get("enabled") for item in graph_stats):
-        errors.append("decode CUDA Graphs were not enabled for every row")
+    if graph_stats and any(item.get("enabled") for item in graph_stats):
+        errors.append("decode CUDA Graphs were unexpectedly enabled")
     graph_replays = _max_counter(graph_stats, "replays")
+    graph_captures = _max_counter(graph_stats, "captures")
     graph_failures = _max_counter(graph_stats, "failures")
-    if graph_replays <= 0:
-        errors.append("decode CUDA Graphs produced zero replays")
+    if graph_captures > 0 or graph_replays > 0:
+        errors.append(
+            "decode CUDA Graphs captured or replayed in the eager-only profile"
+        )
     if graph_failures > 0:
         failure_messages = sorted(
             {
@@ -345,21 +348,41 @@ def audit_gemma4_dense_fast_path(path: Path) -> dict:
             f"decode CUDA Graphs reported {graph_failures} failure(s): "
             + "; ".join(failure_messages)
         )
+    if len(execution_stats) != len(successful):
+        errors.append("decode_execution stats missing from one or more rows")
+    if execution_stats and not all(
+        bool(item.get("prefer_step")) == prefer_step for item in execution_stats
+    ):
+        errors.append("scheduler decode route does not match the model profile")
+    decode_step_batches = _max_counter(execution_stats, "decode_step_batches")
+    multi_step_batches = _max_counter(execution_stats, "multi_step_batches")
+    if prefer_step:
+        if decode_step_batches <= 0:
+            errors.append("E4B flat decode_step route was never exercised")
+        if multi_step_batches > 0:
+            errors.append("E4B unexpectedly used the slow decode_multi_step route")
+    elif multi_step_batches <= 0:
+        errors.append("dense Gemma multi-step route was never exercised")
 
     report = {
         "status": "failed" if errors else "passed",
         "raw_jsonl": str(path),
         "successful_rows": len(successful),
         "failed_rows": len(failed),
-        "decode_graph_preflight": graph_preflights[0] if graph_preflights else None,
         "required": {
             "flat_decode_ready": bool(
                 decode_stats and all(item.get("flat_decode_ready") for item in decode_stats)
             ),
-            "decode_cuda_graphs_enabled": bool(
-                graph_stats and all(item.get("enabled") for item in graph_stats)
+            "decode_mode": (
+                "flat_single_step_eager" if prefer_step else "flat_multi_step_eager"
             ),
-            "decode_cuda_graph_captures": _max_counter(graph_stats, "captures"),
+            "prefer_step": prefer_step,
+            "decode_step_batches": decode_step_batches,
+            "multi_step_batches": multi_step_batches,
+            "decode_cuda_graphs_disabled": bool(
+                graph_stats and not any(item.get("enabled") for item in graph_stats)
+            ),
+            "decode_cuda_graph_captures": graph_captures,
             "decode_cuda_graph_replays": graph_replays,
             "decode_cuda_graph_failures": graph_failures,
             "request_scheduler_reuse_count": _max_counter(
@@ -540,7 +563,7 @@ def main() -> int:
         "hardware_label": hardware_label,
         "variants": [variant.name for variant in variants],
         "megagemm_profile": megagemm_profile,
-        "megagemm_profile_env": MEGAGEMM_PROFILES[megagemm_profile],
+        "megagemm_profile_env": profile_environment(megagemm_profile, args.model),
         "effective_warmup": effective_warmup,
         "effective_max_seq_len": effective_max_seq_len,
         "fastpath_audits": {},
@@ -555,13 +578,13 @@ def main() -> int:
             command,
             cwd=ROOT,
             check=True,
-            env=child_environment(variant, megagemm_profile),
+            env=child_environment(variant, megagemm_profile, args.model),
         )
         if variant.backend == "megagemm" and megagemm_profile == "gemma4-dense-fast":
             variant_raw_path = raw_path(
                 run_dir, run_id, hardware_label, variant
             )
-            audit = audit_gemma4_dense_fast_path(variant_raw_path)
+            audit = audit_gemma4_dense_fast_path(variant_raw_path, args.model)
             audit_path = run_dir / f"fastpath_audit_{variant.name}.json"
             audit_path.write_text(json.dumps(audit, indent=2), encoding="utf-8")
             manifest["fastpath_audits"][variant.name] = audit

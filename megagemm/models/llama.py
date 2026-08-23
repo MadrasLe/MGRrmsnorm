@@ -933,41 +933,6 @@ def _gemma4_a100_a4b_decode_graph_shape(
     )
 
 
-def _gemma4_dense_l4_decode_graph_shape(
-    config,
-    *,
-    num_seqs: int,
-    dtype: torch.dtype,
-    device_type: str,
-    device_name: str,
-) -> bool:
-    """Opt-in policy for the two dense Gemma 4 checkpoints on NVIDIA L4."""
-    if not _env_enabled("MEGAGEMM_GEMMA4_DENSE_L4_DECODE_GRAPHS", default=False):
-        return False
-    layer_types = list(getattr(config, "layer_types", ()) or ())
-    geometry = (
-        int(getattr(config, "hidden_size", 0)),
-        int(getattr(config, "num_hidden_layers", 0)),
-        int(getattr(config, "num_key_value_heads", 0)),
-        int(getattr(config, "num_kv_shared_layers", 0)),
-        layer_types.count("sliding_attention"),
-        layer_types.count("full_attention"),
-    )
-    return bool(
-        str(getattr(config, "model_type", "")) == "gemma4_text"
-        and not bool(getattr(config, "enable_moe_block", False))
-        and geometry
-        in {
-            (1536, 35, 1, 20, 28, 7),  # Gemma 4 E2B
-            (2560, 42, 2, 18, 35, 7),  # Gemma 4 E4B
-        }
-        and int(num_seqs) in (1, 2, 4, 8)
-        and dtype == torch.bfloat16
-        and str(device_type) == "cuda"
-        and "L4" in str(device_name).upper().replace("-", " ").split()
-    )
-
-
 def _gemma4_a100_a4b_tuned_lm_head_shape(
     model_type: str,
     rows: int,
@@ -11141,24 +11106,12 @@ class MegaGemmLlama(nn.Module):
         device_type: str,
         device_name: str,
     ) -> bool:
-        return bool(
-            _gemma4_a100_a4b_decode_graph_shape(
-                self.config,
-                num_seqs=num_seqs,
-                dtype=dtype,
-                device_type=device_type,
-                device_name=device_name,
-            )
-            or (
-                bool(getattr(self, "_flat_decode_ready", False))
-                and _gemma4_dense_l4_decode_graph_shape(
-                    self.config,
-                    num_seqs=num_seqs,
-                    dtype=dtype,
-                    device_type=device_type,
-                    device_name=device_name,
-                )
-            )
+        return _gemma4_a100_a4b_decode_graph_shape(
+            self.config,
+            num_seqs=num_seqs,
+            dtype=dtype,
+            device_type=device_type,
+            device_name=device_name,
         )
 
     def _compute_per_layer_inputs(

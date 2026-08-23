@@ -98,6 +98,23 @@ class _GreedyTokenBurstModel:
         return input_ids[:, 0] + 1
 
 
+class _MultiStepCapableModel:
+    def decode_multi_step(self, *args, **kwargs):
+        raise AssertionError("the route test replaces the scheduler method")
+
+
+def _add_running_greedy_request(scheduler):
+    scheduler._running[0] = Request(
+        request_id=0,
+        seq_id=0,
+        prompt_ids=[1, 2],
+        generated_ids=[3],
+        status=RequestStatus.RUNNING,
+        max_new_tokens=3,
+        temperature=0.0,
+    )
+
+
 def test_scheduler_returns_request_completed_during_single_prefill():
     scheduler = Scheduler(
         _PrefillOnlyModel(),
@@ -113,6 +130,69 @@ def test_scheduler_returns_request_completed_during_single_prefill():
     assert completed[0].generated_ids == [3]
     assert len(scheduler._completed) == 1
     assert scheduler.has_pending() is False
+
+
+def test_scheduler_can_prefer_eager_decode_step_without_cuda_graphs(monkeypatch):
+    monkeypatch.setenv("MEGAGEMM_DECODE_PREFER_STEP", "1")
+    monkeypatch.setenv("MEGAGEMM_DECODE_CUDA_GRAPHS", "0")
+    scheduler = Scheduler(
+        _MultiStepCapableModel(),
+        _FakeBlockManager(),
+        max_batch_size=1,
+        device="cpu",
+    )
+    _add_running_greedy_request(scheduler)
+    routes = []
+    monkeypatch.setattr(
+        scheduler, "_decode_batch", lambda: routes.append("step") or []
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "_decode_multi_step_batch",
+        lambda _burst: routes.append("multi") or [],
+    )
+
+    scheduler.step()
+
+    assert routes == ["step"]
+    stats = scheduler.get_stats()["decode_execution"]
+    assert stats == {
+        "prefer_step": True,
+        "decode_step_batches": 1,
+        "multi_step_batches": 0,
+    }
+    assert scheduler._decode_cuda_graphs is False
+
+
+def test_scheduler_keeps_multi_step_as_default(monkeypatch):
+    monkeypatch.delenv("MEGAGEMM_DECODE_PREFER_STEP", raising=False)
+    monkeypatch.setenv("MEGAGEMM_DECODE_CUDA_GRAPHS", "0")
+    scheduler = Scheduler(
+        _MultiStepCapableModel(),
+        _FakeBlockManager(),
+        max_batch_size=1,
+        device="cpu",
+    )
+    _add_running_greedy_request(scheduler)
+    routes = []
+    monkeypatch.setattr(
+        scheduler, "_decode_batch", lambda: routes.append("step") or []
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "_decode_multi_step_batch",
+        lambda _burst: routes.append("multi") or [],
+    )
+
+    scheduler.step()
+
+    assert routes == ["multi"]
+    stats = scheduler.get_stats()["decode_execution"]
+    assert stats == {
+        "prefer_step": False,
+        "decode_step_batches": 0,
+        "multi_step_batches": 1,
+    }
 
 
 def test_scheduler_returns_requests_completed_during_packed_prefill():

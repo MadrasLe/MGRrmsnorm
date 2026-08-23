@@ -34,16 +34,35 @@ def test_dense_gemma4_models_select_fast_profile_automatically():
     assert runner.resolve_megagemm_profile("none", "google/gemma-4-E4B-it") == "none"
 
 
-def test_fast_profile_is_scoped_to_megagemm_child():
+def test_fast_profile_is_scoped_and_model_specific(monkeypatch):
     runner = load_runner()
+    monkeypatch.delenv("MEGAGEMM_DECODE_CUDA_GRAPHS", raising=False)
+    monkeypatch.setenv("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
-    mega_env = runner.child_environment(runner.VARIANTS["megagemm-bf16"], "gemma4-dense-fast")
-    vllm_env = runner.child_environment(runner.VARIANTS["vllm-bf16"], "gemma4-dense-fast")
+    e4b_env = runner.child_environment(
+        runner.VARIANTS["megagemm-bf16"],
+        "gemma4-dense-fast",
+        "google/gemma-4-E4B-it",
+    )
+    e2b_env = runner.child_environment(
+        runner.VARIANTS["megagemm-bf16"],
+        "gemma4-dense-fast",
+        "google/gemma-4-E2B-it",
+    )
+    vllm_env = runner.child_environment(
+        runner.VARIANTS["vllm-bf16"],
+        "gemma4-dense-fast",
+        "google/gemma-4-E4B-it",
+    )
 
-    assert mega_env["MEGAGEMM_FLAT_DECODE"] == "1"
-    assert mega_env["MEGAGEMM_DECODE_CUDA_GRAPHS"] == "1"
-    assert mega_env["MEGAGEMM_GEMMA4_FUSED_GATEUP_DECODE"] == "1"
-    assert mega_env["MEGAGEMM_GEMMA4_DEEPFUSION_MLP_DECODE"] == "1"
+    assert e4b_env["MEGAGEMM_FLAT_DECODE"] == "1"
+    assert e4b_env["MEGAGEMM_DISABLE_CUDA_RMSNORM"] == "0"
+    assert e4b_env["MEGAGEMM_DECODE_CUDA_GRAPHS"] == "0"
+    assert e4b_env["MEGAGEMM_DECODE_PREFER_STEP"] == "1"
+    assert e4b_env["MEGAGEMM_GEMMA4_FUSED_GATEUP_DECODE"] == "1"
+    assert e4b_env["MEGAGEMM_GEMMA4_DEEPFUSION_MLP_DECODE"] == "1"
+    assert "CUBLAS_WORKSPACE_CONFIG" not in e4b_env
+    assert e2b_env["MEGAGEMM_DECODE_PREFER_STEP"] == "0"
     assert "MEGAGEMM_DECODE_CUDA_GRAPHS" not in vllm_env
 
 
@@ -74,33 +93,29 @@ def test_fast_path_audit_proves_runtime_and_reports_selected_kernels(tmp_path):
         },
         "scheduler_stats": {
             "decode_cuda_graphs": {
-                "enabled": True,
-                "captures": 2,
-                "replays": 30,
+                "enabled": False,
+                "captures": 0,
+                "replays": 0,
                 "failures": 0,
                 "request_scheduler_reuse_count": 3,
-            }
-        },
-        "megagemm_decode_graph_preflight": {
-            "status": "passed",
-            "cases": [
-                {
-                    "batch_size": 1,
-                    "token_exact": True,
-                    "captures": 1,
-                    "replays": 5,
-                    "failures": 0,
-                }
-            ],
-            "errors": [],
+            },
+            "decode_execution": {
+                "prefer_step": True,
+                "decode_step_batches": 127,
+                "multi_step_batches": 0,
+            },
         },
     }
     raw_path.write_text(json.dumps(row) + "\n", encoding="utf-8")
 
-    report = runner.audit_gemma4_dense_fast_path(raw_path)
+    report = runner.audit_gemma4_dense_fast_path(
+        raw_path, "google/gemma-4-E4B-it"
+    )
 
     assert report["status"] == "passed"
-    assert report["required"]["decode_cuda_graph_replays"] == 30
+    assert report["required"]["decode_mode"] == "flat_single_step_eager"
+    assert report["required"]["decode_cuda_graph_replays"] == 0
+    assert report["required"]["decode_step_batches"] == 127
     assert report["selected_kernel_counters"]["gemma4_flat_fused_qkv_layers"] == 42
     assert report["selected_kernel_counters"]["gemma4_flat_fused_gateup"] == 80
     assert report["selected_kernel_counters"]["gemma4_flat_deepfusion"] == 70
@@ -121,23 +136,26 @@ def test_fast_path_audit_rejects_eager_fallback(tmp_path):
         "scheduler_stats": {
             "decode_cuda_graphs": {
                 "enabled": True,
-                "captures": 0,
-                "replays": 0,
+                "captures": 1,
+                "replays": 2,
                 "failures": 1,
                 "last_failure": "capture failed",
-            }
-        },
-        "megagemm_decode_graph_preflight": {
-            "status": "failed",
-            "cases": [],
-            "errors": ["capture failed"],
+            },
+            "decode_execution": {
+                "prefer_step": False,
+                "decode_step_batches": 0,
+                "multi_step_batches": 8,
+            },
         },
     }
     raw_path.write_text(json.dumps(row) + "\n", encoding="utf-8")
 
-    report = runner.audit_gemma4_dense_fast_path(raw_path)
+    report = runner.audit_gemma4_dense_fast_path(
+        raw_path, "google/gemma-4-E4B-it"
+    )
 
     assert report["status"] == "failed"
     assert any("flat decode not ready" in error for error in report["errors"])
-    assert any("zero replays" in error for error in report["errors"])
+    assert any("unexpectedly enabled" in error for error in report["errors"])
+    assert any("does not match" in error for error in report["errors"])
     assert any("capture failed" in error for error in report["errors"])
