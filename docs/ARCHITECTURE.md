@@ -1,9 +1,7 @@
 # Architecture
 
 MegaGemm is an experimental full-stack inference runtime rather than a single
-kernel library. The project is solo-designed and architected by Gabriel Yogi;
-AI-assisted development is used to accelerate implementation and bounded
-validation work such as kernel tests, latency measurement, and comparisons.
+kernel library. The project is solo-designed and architected by Gabriel Yogi.
 
 ## Runtime flow
 
