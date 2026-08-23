@@ -13761,6 +13761,12 @@ class MegaGemmLlama(nn.Module):
             "gemma4_flat_fused_gateup_hits": int(
                 getattr(self, "_gemma4_flat_fused_gateup_hits", 0)
             ),
+            "gemma4_flat_fused_qkv_layers": int(
+                sum(
+                    getattr(layer, "qkv_wt", None) is not None
+                    for layer in (getattr(self, "_flat_layer_weights", None) or ())
+                )
+            ),
             "gemma4_flat_fused_gateup_runtime_disabled": bool(
                 getattr(self, "_gemma4_flat_fused_gateup_runtime_disabled", False)
             ),

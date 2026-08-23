@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shlex
 import shutil
 import subprocess
@@ -41,6 +42,69 @@ VARIANTS = {
         "megagemm-int8", "megagemm", dtype="fp16", quantize="int8"
     ),
 }
+
+
+# Conservative dense Gemma 4 profile.  It deliberately excludes the A100/A4B
+# MoE-only switches and the unproven L4 GQA2 override.  Shape-dependent kernels
+# still keep their internal correctness/performance gates; the audit emitted by
+# this runner records which of those gates actually promoted a fast path.
+GEMMA4_DENSE_FAST_PROFILE = {
+    # Runtime topology and stable decode graph lifecycle.
+    "MEGAGEMM_FP16_STREAMING": "1",
+    "MEGAGEMM_FLAT_DECODE": "1",
+    "MEGAGEMM_DISABLE_CUDA_RMSNORM": "1",
+    "MEGAGEMM_DECODE_CUDA_GRAPHS": "1",
+    "MEGAGEMM_DECODE_CUDA_GRAPHS_PREFER_STEP": "1",
+    "MEGAGEMM_DECODE_CUDA_GRAPHS_SHAPE_CACHE": "1",
+    "MEGAGEMM_DECODE_CUDA_GRAPHS_SHARED_SHAPE_CACHE": "0",
+    "MEGAGEMM_REUSE_REQUEST_SCHEDULER": "1",
+    "MEGAGEMM_DECODE_CUDA_GRAPHS_STABLE_MAX_BLOCKS": "1",
+    "MEGAGEMM_DECODE_GRAPH_TOKEN_BURST": "0",
+    # Dense decode kernels and fused tails.
+    "MEGAGEMM_FUSED_ROPE_ATTN": "1",
+    "MEGAGEMM_FAST_GEMV": "1",
+    "MEGAGEMM_DEEPFUSION_MLP": "1",
+    "MEGAGEMM_GEMMA4_FUSED_QKV_DECODE": "1",
+    "MEGAGEMM_GEMMA4_FUSED_GATEUP_DECODE": "1",
+    "MEGAGEMM_GEMMA4_DEEPFUSION_MLP_DECODE": "1",
+    "MEGAGEMM_FUSED_LM_HEAD_ARGMAX_DECODE": "1",
+    "MEGAGEMM_FUSED_RMSNORM_LM_HEAD_ARGMAX_DECODE": "1",
+    # Dense prefill paths.  Their shape gates remain authoritative.
+    "MEGAGEMM_GEMMA4_FUSED_QKV_PREFILL": "1",
+    "MEGAGEMM_GEMMA4_FUSED_ATTN_PREP_PREFILL": "1",
+    "MEGAGEMM_GEMMA4_IMPLICIT_CAUSAL_PREFILL": "1",
+    "MEGAGEMM_GEMMA4_LONG_SLIDING_PREFILL": "1",
+    "MEGAGEMM_GEMMA4_LONG_FULL_PREFILL": "1",
+    "MEGAGEMM_GEMMA4_VECTORIZED_PREFILL_KV": "1",
+    "MEGAGEMM_GEMMA4_FUSED_DUAL_FFN_NORM_PREFILL": "1",
+    "MEGAGEMM_GEMMA4_FUSED_ADD_FFN_NORM_PREFILL": "1",
+    "MEGAGEMM_GEMMA4_FUSED_POST_FFN_NORMS_PREFILL": "1",
+    "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
+}
+
+
+MEGAGEMM_PROFILES = {
+    "none": {},
+    "gemma4-dense-fast": GEMMA4_DENSE_FAST_PROFILE,
+}
+
+
+def resolve_megagemm_profile(requested: str, model: str) -> str:
+    if requested != "auto":
+        return requested
+    normalized = model.lower()
+    if "gemma-4-" in normalized and any(
+        size in normalized for size in ("e2b", "e4b")
+    ):
+        return "gemma4-dense-fast"
+    return "none"
+
+
+def child_environment(variant: Variant, profile: str) -> dict[str, str]:
+    env = os.environ.copy()
+    if variant.backend == "megagemm":
+        env.update(MEGAGEMM_PROFILES[profile])
+    return env
 
 
 def parse_variants(raw: str) -> list[Variant]:
@@ -92,6 +156,7 @@ def command_for(
     hardware_label: str,
     run_dir: Path,
     run_id: str,
+    warmup: int,
 ) -> list[str]:
     command = [
         sys.executable,
@@ -111,7 +176,7 @@ def command_for(
         "--repeats",
         str(args.repeats),
         "--warmup",
-        str(args.warmup),
+        str(warmup),
         "--out-dir",
         str(run_dir),
         "--run-id",
@@ -167,6 +232,181 @@ def summary_path(
     )
 
 
+def raw_path(
+    run_dir: Path,
+    run_id: str,
+    hardware_label: str,
+    variant: Variant,
+) -> Path:
+    return run_dir / f"{run_id}_{variant.name}_{hardware_label}_{variant.backend}.jsonl"
+
+
+def _max_counter(stats: list[dict], key: str) -> int:
+    return max((int(item.get(key, 0) or 0) for item in stats), default=0)
+
+
+def audit_gemma4_dense_fast_path(path: Path) -> dict:
+    """Prove that the required fast runtime was used, then report gated kernels."""
+    rows = [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    successful = [row for row in rows if row.get("ok")]
+    if not successful:
+        return {
+            "status": "failed",
+            "raw_jsonl": str(path),
+            "successful_rows": 0,
+            "errors": ["no successful benchmark rows"],
+        }
+
+    decode_stats = [
+        row.get("decode_runtime_stats")
+        for row in successful
+        if isinstance(row.get("decode_runtime_stats"), dict)
+    ]
+    scheduler_stats = [
+        row.get("scheduler_stats")
+        for row in successful
+        if isinstance(row.get("scheduler_stats"), dict)
+    ]
+    graph_stats = [
+        item.get("decode_cuda_graphs")
+        for item in scheduler_stats
+        if isinstance(item.get("decode_cuda_graphs"), dict)
+    ]
+    paged_stats = [
+        item.get("paged_decode_runtime")
+        for item in decode_stats
+        if isinstance(item.get("paged_decode_runtime"), dict)
+    ]
+
+    errors: list[str] = []
+    if len(decode_stats) != len(successful):
+        errors.append("decode_runtime_stats missing from one or more rows")
+    if decode_stats and not all(item.get("flat_decode_ready") for item in decode_stats):
+        reasons = sorted(
+            {
+                str(item.get("flat_decode_failed_reason") or "unknown")
+                for item in decode_stats
+                if not item.get("flat_decode_ready")
+            }
+        )
+        errors.append(f"flat decode not ready: {', '.join(reasons)}")
+    if decode_stats and any(item.get("flat_decode_failed") for item in decode_stats):
+        errors.append("flat decode reported a runtime failure")
+    if len(graph_stats) != len(successful):
+        errors.append("decode_cuda_graphs stats missing from one or more rows")
+    if graph_stats and not all(item.get("enabled") for item in graph_stats):
+        errors.append("decode CUDA Graphs were not enabled for every row")
+    graph_replays = _max_counter(graph_stats, "replays")
+    graph_failures = _max_counter(graph_stats, "failures")
+    if graph_replays <= 0:
+        errors.append("decode CUDA Graphs produced zero replays")
+    if graph_failures > 0:
+        failure_messages = sorted(
+            {
+                str(item.get("last_failure") or "unspecified")
+                for item in graph_stats
+                if int(item.get("failures", 0) or 0) > 0
+            }
+        )
+        errors.append(
+            f"decode CUDA Graphs reported {graph_failures} failure(s): "
+            + "; ".join(failure_messages)
+        )
+
+    report = {
+        "status": "failed" if errors else "passed",
+        "raw_jsonl": str(path),
+        "successful_rows": len(successful),
+        "required": {
+            "flat_decode_ready": bool(
+                decode_stats and all(item.get("flat_decode_ready") for item in decode_stats)
+            ),
+            "decode_cuda_graphs_enabled": bool(
+                graph_stats and all(item.get("enabled") for item in graph_stats)
+            ),
+            "decode_cuda_graph_captures": _max_counter(graph_stats, "captures"),
+            "decode_cuda_graph_replays": graph_replays,
+            "decode_cuda_graph_failures": graph_failures,
+            "request_scheduler_reuse_count": _max_counter(
+                graph_stats, "request_scheduler_reuse_count"
+            ),
+        },
+        # These are performance-gated.  Zero means the profile requested the
+        # path but its kernel gate rejected this exact model/batch/GPU shape.
+        "selected_kernel_counters": {
+            "gemma4_flat_fused_qkv_layers": _max_counter(
+                decode_stats, "gemma4_flat_fused_qkv_layers"
+            ),
+            "fused_rope_attention": _max_counter(
+                decode_stats, "fused_rope_attn_total_hits"
+            ),
+            "gemma4_fused_qkv_prefill": _max_counter(
+                decode_stats, "gemma4_fused_qkv_prefill_hits"
+            ),
+            "gemma4_fused_attention_prepare": _max_counter(
+                decode_stats, "gemma4_fused_attn_prepare_hits"
+            ),
+            "gemma4_vectorized_prefill_kv": _max_counter(
+                decode_stats, "gemma4_batch_prefill_vectorized_kv_hits"
+            ),
+            "gemma4_flat_fused_gateup": _max_counter(
+                decode_stats, "gemma4_flat_fused_gateup_hits"
+            ),
+            "gemma4_flat_deepfusion": _max_counter(
+                decode_stats, "gemma4_flat_deepfusion_hits"
+            ),
+            "gemma4_fused_dual_ffn_norm_prefill": _max_counter(
+                decode_stats, "gemma4_fused_dual_ffn_norm_prefill_hits"
+            ),
+            "gemma4_fused_add_ffn_norm_prefill": _max_counter(
+                decode_stats, "gemma4_fused_add_ffn_norm_prefill_hits"
+            ),
+            "gemma4_fused_post_ffn_norm_prefill": _max_counter(
+                decode_stats, "gemma4_fused_post_ffn_norm_prefill_hits"
+            ),
+            "paged_attention_generic_direct": _max_counter(
+                paged_stats, "generic_direct_hits"
+            ),
+            "paged_attention_gqa2_direct": _max_counter(
+                paged_stats, "gqa2_direct_hits"
+            ),
+        },
+        "selected_lm_head": {
+            "fused_rmsnorm_lm_head_argmax": any(
+                bool(item.get("fused_rmsnorm_lm_head_argmax_use"))
+                for item in decode_stats
+            ),
+            "fused_lm_head_argmax": any(
+                bool(item.get("fused_lm_head_argmax_use")) for item in decode_stats
+            ),
+            "rmsnorm_skip_reasons": sorted(
+                {
+                    str(item.get("fused_rmsnorm_lm_head_argmax_skip_reason"))
+                    for item in decode_stats
+                    if item.get("fused_rmsnorm_lm_head_argmax_skip_reason")
+                }
+            ),
+            "lm_head_skip_reasons": sorted(
+                {
+                    str(item.get("fused_lm_head_argmax_skip_reason"))
+                    for item in decode_stats
+                    if item.get("fused_lm_head_argmax_skip_reason")
+                }
+            ),
+        },
+        "errors": errors,
+    }
+    return report
+
+
+def write_manifest(path: Path, manifest: dict) -> None:
+    path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Compact same-environment MegaGemm/vLLM GPU matrix"
@@ -186,6 +426,15 @@ def main() -> int:
     parser.add_argument("--max-new-tokens", type=int, default=128)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--warmup", type=int, default=1)
+    parser.add_argument(
+        "--megagemm-profile",
+        choices=["auto", *MEGAGEMM_PROFILES],
+        default="auto",
+        help=(
+            "MegaGemm child-process profile. auto enables gemma4-dense-fast "
+            "for Gemma 4 E2B/E4B and otherwise selects none."
+        ),
+    )
     parser.add_argument("--max-seq-len", type=int, default=4096)
     parser.add_argument("--max-batch-size", type=int, default=8)
     parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.90)
@@ -199,6 +448,8 @@ def main() -> int:
     args = parser.parse_args()
 
     variants = parse_variants(args.variants)
+    megagemm_profile = resolve_megagemm_profile(args.megagemm_profile, args.model)
+    effective_warmup = max(args.warmup, 3) if megagemm_profile != "none" else args.warmup
     hardware_label = args.hardware_label or auto_hardware_label()
     run_id = args.run_id or f"publication_{time.strftime('%Y%m%d_%H%M%S')}"
     run_dir = Path(args.out_dir)
@@ -213,6 +464,7 @@ def main() -> int:
             hardware_label=hardware_label,
             run_dir=run_dir,
             run_id=run_id,
+            warmup=effective_warmup,
         )
         for variant in variants
     ]
@@ -221,6 +473,8 @@ def main() -> int:
     print(f"  model:    {args.model}")
     print(f"  hardware: {hardware_label}")
     print(f"  variants: {', '.join(variant.name for variant in variants)}")
+    print(f"  MegaGemm profile: {megagemm_profile}")
+    print(f"  warmups: {effective_warmup}")
     print(f"  output:   {run_dir}")
     for command in commands:
         print(f"\n{shell_join(command)}")
@@ -228,21 +482,48 @@ def main() -> int:
         return 0
 
     run_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = run_dir / "manifest.json"
     manifest = {
         "run_id": run_id,
         "model": args.model,
         "hardware_label": hardware_label,
         "variants": [variant.name for variant in variants],
+        "megagemm_profile": megagemm_profile,
+        "megagemm_profile_env": MEGAGEMM_PROFILES[megagemm_profile],
+        "effective_warmup": effective_warmup,
+        "fastpath_audits": {},
         "args": vars(args),
         "commands": commands,
     }
-    (run_dir / "manifest.json").write_text(
-        json.dumps(manifest, indent=2), encoding="utf-8"
-    )
+    write_manifest(manifest_path, manifest)
 
     for variant, command in zip(variants, commands):
         print(f"\n=== {variant.name} ===", flush=True)
-        subprocess.run(command, cwd=ROOT, check=True)
+        subprocess.run(
+            command,
+            cwd=ROOT,
+            check=True,
+            env=child_environment(variant, megagemm_profile),
+        )
+        if variant.backend == "megagemm" and megagemm_profile == "gemma4-dense-fast":
+            variant_raw_path = raw_path(
+                run_dir, run_id, hardware_label, variant
+            )
+            audit = audit_gemma4_dense_fast_path(variant_raw_path)
+            audit_path = run_dir / f"fastpath_audit_{variant.name}.json"
+            audit_path.write_text(json.dumps(audit, indent=2), encoding="utf-8")
+            manifest["fastpath_audits"][variant.name] = audit
+            write_manifest(manifest_path, manifest)
+            print(
+                "  fast-path audit: "
+                f"{audit['status']} ({audit_path})",
+                flush=True,
+            )
+            if audit["status"] != "passed":
+                raise RuntimeError(
+                    "Gemma 4 dense fast-path audit failed: "
+                    + " | ".join(audit.get("errors") or ["unknown error"])
+                )
 
     for vllm in (item for item in variants if item.backend == "vllm"):
         right = summary_path(run_dir, run_id, hardware_label, vllm)
