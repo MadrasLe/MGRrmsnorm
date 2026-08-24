@@ -731,7 +731,7 @@ def cmd_mesh_shard_generate_replicas(args):
 def main():
     parser = argparse.ArgumentParser(
         prog='megagemm',
-        description='🔥 MegaGemm — High-performance LLM inference engine',
+        description='MegaGemm - High-performance LLM inference engine',
     )
     subparsers = parser.add_subparsers(dest='command', help='Available commands')
 
@@ -740,7 +740,11 @@ def main():
         p.add_argument('--model', '-m', required=True, help='HuggingFace model ID, local snapshot path, or .mgx artifact')
         p.add_argument('--device', default='cuda', choices=['cuda', 'cpu'], help='Device (default: cuda)')
         p.add_argument('--bf16', action='store_true', help='Use bfloat16 instead of float16')
-        p.add_argument('--quantize', '-q', choices=['int8', 'int4', 'fp8', 'awq'], help='Quantization mode')
+        p.add_argument(
+            '--quantize', '-q',
+            choices=['int8', 'int4', 'fp8', 'awq'],
+            help="Quantization mode; fp8 is a legacy alias for the INT8 W8A16 path",
+        )
         p.add_argument('--max-seq-len', type=int, default=4096, help='Max sequence length (default: 4096)')
         p.add_argument('--deterministic', '-d', action='store_true', help='Enable deterministic mode (bit-exact output)')
         p.add_argument('--seed', type=int, default=42, help='Random seed for deterministic mode (default: 42)')

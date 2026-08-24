@@ -638,7 +638,8 @@ class InferenceEngine:
             cache_dir: HuggingFace cache directory
             n_gpu_layers: Layers on GPU (-1=all). Rest offloaded to CPU/disk.
             offload_dir: Directory for disk offload (None=CPU only)
-            quantize: Quantization mode (None, 'int8', 'fp8').
+            quantize: Quantization mode. Use 'int8' for streaming INT8 W8A16;
+                'fp8' is retained as a legacy alias for that same INT8 path.
             kv_offload: Enable KV cache CPU offloading for longer contexts
             num_cpu_blocks: KV cache blocks on CPU (0=auto: use 50% of free RAM)
             gpu_window: Min blocks to keep on GPU per sequence (when kv_offload=True)

@@ -24,7 +24,7 @@ In a separate warm exact-prefix reuse matrix, **MGX+Prophet reached 102.8% of vL
 geometric-mean throughput and won three of four measured rows**.
 See [Performance](#-performance) for the complete breakdown and limitations.
 
-**Project guides:** [Architecture](docs/ARCHITECTURE.md) ·
+**Project guides:** [Engine internals](docs/ENGINE.md) · [Architecture](docs/ARCHITECTURE.md) ·
 [Dependencies](docs/DEPENDENCIES.md) · [Benchmark evidence](docs/BENCHMARKS.md) ·
 [Test suite](tests/README.md) · [Contributing](CONTRIBUTING.md)
 
@@ -96,8 +96,9 @@ vLLM is a strong, mature baseline. The truth is **it depends on the regime**:
   L4 Qwen 2.5 FP16 row at batch 8 / prompt 2048, vLLM leads by 15.7%. Older T4 configurations
   recorded substantially larger gaps.
 - **Breadth and battle-testing**: far more models, quantization formats, and production hardening.
-- MegaGemm has **no FlashAttention path on its packed attention**; that path falls back to
-  per-sequence SDPA on the PyTorch backend.
+- **Packed-prefill backend availability** varies by environment and shape. MegaGemm uses
+  FlashAttention varlen when the optional `flash-attn` package is available, otherwise it selects
+  among a native Triton packed kernel, uniform-batch PyTorch SDPA, and per-sequence SDPA fallback.
 
 ### CPU: MicroGemm versus llama.cpp
 
@@ -127,10 +128,10 @@ tokens, two warmups and five repetitions; [report](docs/qwen25_cpu_microgemm_vs_
 
 ### Inference Engine
 - 🧠 **Multi-Model** — LLaMA 3.x, Mistral 7B, Qwen 2.5, Qwen 3, **Qwen 3.5 (hybrid linear-attention)**, Gemma 2, and **Gemma 4 mixed-layer/MoE text backbones**
-- 🔢 **INT8 W8A16** — per-channel, 2x compression, ~0.999 cosine similarity, **faster than FP16**
+- 🔢 **INT8 W8A16** — per-channel streaming load with approximately 2x weight compression; speedup is model-, shape-, and hardware-dependent
 - 🧱 **AWQ 4-bit** — load pre-quantized AWQ models (4x compression)
 - 📄 **Paged KV Cache** — BlockManager with configurable block size + **layer-aware allocation**
-- 🔄 **KV Cache CPU Offload** — `TieredBlockManager` moves cold KV to pinned CPU RAM (10x capacity, 0% quality loss)
+- 🔄 **KV Cache CPU Offload** — `TieredBlockManager` moves cold KV blocks to pinned CPU RAM on compatible homogeneous-cache architectures
 - ⚡ **Paged Attention** — Triton decode kernel with online softmax
 - 🧬 **GQA / MQA** — grouped-query and multi-query attention
 - 🧬 **Gemma 4 heterogeneous attention** — per-layer head/KV geometry and RoPE, sliding/full attention schedules, K=V and cross-layer KV sharing
@@ -138,6 +139,13 @@ tokens, two warmups and five repetitions; [report](docs/qwen25_cpu_microgemm_vs_
 - 🧠 **Gemma 4 MoE** — shared dense branch plus routed experts, with custom top-k routing and grouped/segmented prefill paths
 - 🔄 **Continuous Batching** — iteration-level scheduler
 - 💾 **Layer Offloading** — run models larger than VRAM (GPU+CPU)
+
+### Embedding Engine
+- 🧭 **Encoder checkpoints** — plain Hugging Face encoders and common BERT, MiniLM, and MPNet-family embedding checkpoints
+- 🧱 **Native BERT path** — native encoder execution with optional padding-free packed attention; unsupported shapes retain the Hugging Face backend
+- 🔗 **Sentence Transformers layouts** — reads Transformer, Pooling, Dense, Normalize, prompts, and module metadata without requiring the `sentence-transformers` package
+- 📐 **Pooling and normalization** — CLS, mean, max, mean-sqrt-length, weighted mean, last-token, optional Dense heads, and L2 normalization
+- 📦 **Throughput-aware batching** — length sorting, `max_batch_tokens`, pinned host transfers, and query/document prompt templates
 
 ### 🕸️ MegaMesh — Distributed Inference (experimental)
 - **Replica mode** — full model per worker, weighted prompt router with failover
@@ -235,6 +243,26 @@ engine = InferenceEngine(
     gpu_window=32,          # recent blocks kept on GPU per sequence
 )
 ```
+
+KV offload currently targets architectures whose cache layers share a homogeneous
+layout. Gemma 4 text uses heterogeneous per-layer head geometry and KV sharing, so
+its engine path rejects `kv_offload=True` rather than silently using an incorrect
+cache representation.
+
+### Encoder embeddings
+
+```python
+from megagemm.embeddings import EmbeddingEngine
+
+encoder = EmbeddingEngine(
+    "sentence-transformers/all-MiniLM-L6-v2",
+    backend="auto",          # native BERT path when compatible, otherwise Hugging Face
+    max_batch_tokens=8192,   # bound padded work, not only the number of texts
+)
+vectors = encoder.encode_query(["paged attention", "hybrid linear attention"])
+```
+
+Equivalent CLI entry points are `megagemm embed` and `megagemm embed-bench`.
 
 ### 🔍 XAI — Interpretability diagnostics
 
@@ -445,7 +473,7 @@ int8_layer = Int8Linear.from_linear(original_linear)   # or engine(..., quantize
 |--------|-------|
 | Compression | 2.0x |
 | Cosine similarity | ~0.999 per layer |
-| Speed | **Faster than FP16** (1.31x avg on T4 core suite) |
+| Speed | Workload-dependent; the retained 1.31x T4 core-suite result is historical |
 
 ### AWQ 4-bit (pre-quantized)
 
@@ -523,6 +551,12 @@ HuggingFace Model
  └──────────────────────────────┘
 ```
 
+The generation engine and the encoder-oriented `EmbeddingEngine` are separate
+runtime surfaces. The generation path owns paged KV, scheduling, sampling, and
+architecture-specific decode. The embedding path owns encoder batching, pooling,
+projection heads, and normalization. See [Engine internals](docs/ENGINE.md) for
+their execution contracts and fast-path/fallback policy.
+
 ### Why Qwen 3.5 has a dedicated hybrid runtime
 
 Qwen 3.5 alternates ordinary full-attention blocks with `GatedDeltaNet` linear
@@ -538,6 +572,16 @@ homogeneous transformer path.
 | **Affine prefix scans** | Each chunk is represented as `S' = A @ S + B`. The repository implements an inclusive Hillis–Steele scan plus Torch and Triton Blelloch upsweep/downsweep paths. Blelloch remains preserved and tested, but the current selector maps it to Hillis–Steele because the dense-affine Blelloch route regressed Qwen 3.5 long-prefill on T4. |
 | **Profile-driven policy** | Scan window size, warp count, and short-prefill threshold are selected from GPU generation and problem geometry. Fused RMSNorm+input-projection and RMSNormGated+output-projection routes are measured against their baselines on-device and cached only when they clear the configured gain threshold. |
 | **Decode fast path** | Reusable buffers, fused causal-convolution update, fused gate/recurrent update, FP16 core output, fast linear backends, flat hybrid execution, deepfusion MLP, and fused `lm_head` argmax reduce launch and allocation overhead. |
+
+The current scan choice follows measured wall time, not only work complexity.
+Hillis–Steele performs `O(C log C)` affine compositions for `C` chunks, whereas
+Blelloch is work-efficient at `O(C)`. In this implementation Blelloch still needs
+power-of-two handling, separate upsweep and downsweep phases, intermediate
+workspaces, and a final exclusive-to-inclusive composition. Those extra phase and
+launch costs outweighed the saved arithmetic on the measured T4 long-prefill
+shapes, so the selector currently maps Blelloch aliases to Hillis–Steele. Both
+Torch references and Triton implementations remain versioned and tested; the
+decision is empirical and hardware/shape-specific.
 
 The Qwen 3.5 kernel surface contains **20 Triton JIT routines** across linear
 attention and its fused gated-normalization projections. Its regression module
@@ -583,6 +627,7 @@ and eager/flat-path parity.
 | **Loader** | [`megagemm/models/loader.py`](megagemm/models/loader.py) | HF weight loading, QKV fusion, quantization |
 | **MGX** | [`megagemm/models/mgx.py`](megagemm/models/mgx.py) | Compiled artifact format + session state |
 | **Engine** | [`megagemm/engine/engine.py`](megagemm/engine/engine.py) | Generation loop, sampling, chat templates |
+| **Embedding engine** | [`megagemm/embeddings/`](megagemm/embeddings/) | Native/Hugging Face encoders, pooling, Sentence Transformers layouts, and token-budget batching |
 | **Scheduler** | [`megagemm/engine/scheduler.py`](megagemm/engine/scheduler.py) | Continuous batching |
 | **KV Cache** | [`megagemm/engine/kv_cache.py`](megagemm/engine/kv_cache.py) | Paged BlockManager + TieredBlockManager (GPU+CPU) |
 | **Prophet** | [`megagemm/engine/prophet.py`](megagemm/engine/prophet.py) | Semantic state library |
@@ -616,6 +661,11 @@ and eager/flat-path parity.
 > Models auto-detect architecture, RoPE convention, and chat templates from HuggingFace config.
 > Gemma 4 support currently refers to text-backbone inference, not execution of multimodal towers.
 
+Encoder-style embedding checkpoints use the separate `EmbeddingEngine`. Its native
+backend covers compatible BERT-family absolute-position encoders; other encoder
+architectures use the Hugging Face backend while retaining MegaGemm's batching,
+pooling, Dense/Normalize, and prompt pipeline.
+
 ---
 
 ## 🔬 API Reference
@@ -626,11 +676,15 @@ from megagemm.engine import InferenceEngine
 engine = InferenceEngine(
     model_name="Qwen/Qwen2.5-7B-Instruct",
     dtype=torch.float16,
-    quantize='int8',          # 'int8', 'fp8', or None
-    n_gpu_layers=None,        # layers on GPU (None = all)
+    quantize='int8',          # INT8 W8A16; use None for FP16/BF16
+    n_gpu_layers=-1,          # -1 = all layers on GPU
+    max_batch_size=512,
+    max_seq_len=4096,         # prompt + generated-token capacity target
+    kv_alloc='auto',          # workload-sized KV, capped by free VRAM
     kv_offload=False,         # GPU↔CPU KV tiering
     num_cpu_blocks=0,         # CPU KV blocks (pinned)
     gpu_window=64,            # KV blocks kept on GPU per seq
+    deterministic=False,      # opt-in bit-reproducible mode on the same hardware
     monitor=False,            # collect latency/quality metrics
     dashboard=False,          # live HTML dashboard
 )
@@ -660,7 +714,11 @@ rope = RoPE(head_dim=128, max_seq_len=2048)
 - **Single-node throughput vs vLLM** is regime-dependent (see [Performance](#-performance)). In the
   current uncached L4 FP16 matrix, vLLM wins all six rows while MegaGemm reaches 93.1% of its
   geometric mean. Selected older quantized, hybrid-model, and capacity results are historical.
-- **No FlashAttention path** on packed attention yet (per-sequence SDPA fallback on PyTorch backend).
+- **Packed prefill is backend-dependent**: optional FlashAttention varlen, MegaGemm's Triton packed
+  kernel, uniform-batch SDPA, and per-sequence SDPA are selected according to availability, shape,
+  memory headroom, and runtime policy.
+- **Architecture-specific limits are explicit**: Qwen 3.5 linear attention is currently FP16/BF16;
+  Gemma 4 AWQ, heterogeneous-KV CPU offload, and multimodal-tower execution are not implemented.
 - **MegaMesh** layer-shard mode is experimental: greedy-only, per-prompt prefill, no quantized
   shards, CPU-mediated TTP transport (no NCCL/GPU-direct).
 - **INT8 numbers are speed/memory**, not validated quality; they do not establish
@@ -672,9 +730,10 @@ rope = RoPE(head_dim=128, max_seq_len=2048)
 
 ## ✅ Testing
 
-The repository contains 46 Python test files spanning CPU logic, engine behavior, serialization,
-kernel policy, CUDA/Triton correctness, model integration, and remote GPU harnesses. The suite is
-currently split between unittest/pytest modules and executable assertion scripts.
+The repository contains 46 Python test files and 512 `test_*` functions spanning CPU logic, engine
+behavior, serialization, kernel policy, CUDA/Triton correctness, model integration, and remote GPU
+harnesses. The suite is currently split between unittest/pytest modules and executable assertion
+scripts.
 
 Fast CPU-safe checks:
 

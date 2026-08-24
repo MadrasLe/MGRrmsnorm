@@ -58,6 +58,10 @@ Hugging Face checkpoint or MGX artifact
 prefill, decode, sampling, generation fast paths, and optional monitoring. The
 engine supports sequential generation and scheduler-driven batching.
 
+The public execution contract, memory policy, prefill/decode modes, fast-path
+selection, model-specific limits, and separate encoder runtime are documented in
+[`ENGINE.md`](ENGINE.md).
+
 ### Model execution
 
 The main model implementation contains architecture-specific paths for dense,
@@ -96,11 +100,45 @@ Two parallel prefix families are implemented:
 - **Blelloch:** power-of-two padding, upsweep, downsweep, and final inclusive
   composition, implemented both as a Torch reference and Triton affine kernels.
 
-Blelloch is retained as implemented and correctness-tested research work, but
-the current selector maps Blelloch aliases to Hillis–Steele because the
-dense-affine Blelloch path regressed Qwen 3.5 long-prefill on T4. The default
-policy also keeps the parallel scan opt-in and rejects wide-head cases by default
-unless explicitly forced.
+The choice between them is based on measured wall time rather than asymptotic
+work alone. For `C` chunk transitions, Hillis–Steele performs an inclusive scan
+in `ceil(log2(C))` regular stages. It does `O(C log C)` affine compositions, but
+every stage has the same direct prefix layout and maps cleanly to dense batched
+GPU work. Blelloch is work-efficient at `O(C)`: it pads to a power of two, builds
+an upsweep reduction tree, performs a downsweep to obtain exclusive prefixes,
+and converts them back to the required inclusive result. Its parallel depth is
+still logarithmic, but it has two tree phases plus padding, intermediate state,
+and additional synchronization/launch boundaries.
+
+The current Triton implementations make that wall-time difference concrete.
+Hillis–Steele launches one composition kernel for `A` and one for `B` at each
+offset stage. Blelloch launches the corresponding `A`/`B` pair throughout both
+the upsweep and downsweep, then launches another pair to combine the exclusive
+tree result with each original transition. The work-efficient tree can therefore
+execute fewer affine compositions while still paying more kernel-launch and
+phase-boundary overhead at the chunk counts used by the model.
+
+Those constants matter because each scan element is not a scalar addition. A
+chunk represents the affine map `(A, B)` and ordered composition is
+`(A2 @ A1, A2 @ B1 + B2)`. The scan therefore moves and multiplies dense state
+blocks. On the measured T4 long-prefill shapes, Blelloch's lower theoretical
+work did not become lower end-to-end latency: power-of-two padding, tree
+materialization, extra phases, and less favorable dense-affine GPU occupancy
+outweighed the saved compositions. Hillis–Steele performed more arithmetic but
+finished sooner because its stages were simpler and more regular.
+
+Blelloch is consequently retained as implemented and correctness-tested research
+work, while the current selector maps Blelloch aliases to Hillis–Steele. This is
+an empirical policy decision, not a claim that Hillis–Steele is universally the
+better scan. The default policy also keeps the parallel scan opt-in and rejects
+wide-head cases unless explicitly forced.
+
+Implementing this path required more than selecting a named prefix algorithm:
+the runtime derives associative affine chunk transitions from the delta rule,
+keeps Torch references for both scan families, implements Hillis–Steele and
+Blelloch Triton stages, manages padded/intermediate workspaces, validates ordered
+composition against recurrent execution, and feeds measured regressions back
+into the hardware/shape policy.
 
 Runtime policy is hardware- and shape-aware. GPU capability selects the short
 prefill threshold, scan window, and warp count; the window chooser avoids small
@@ -179,6 +217,28 @@ modules with 236 test functions spanning configuration, PLE, attention/KV
 semantics, MoE routing and execution, long prefill, INT8, graph policies, and
 flat/eager parity.
 
+### Encoder embedding runtime
+
+`EmbeddingEngine` is separate from the autoregressive generation engine. It
+loads plain Hugging Face encoder checkpoints and common Sentence Transformers
+module layouts, then executes the pipeline `Transformer -> Pooling -> Dense* ->
+Normalize` without requiring the `sentence-transformers` package itself.
+
+Compatible BERT-family absolute-position encoders can use the native backend.
+That path fuses Q/K/V projection and supports padding-free packed attention, with
+packed sequence metadata prepared once and reused across layers. Unsupported
+encoder configurations retain the Hugging Face model backend while using the
+same MegaGemm batching, pooling, prompt, projection, and normalization surface.
+
+The batching policy can sort by length and bound padded work with
+`max_batch_tokens`, rather than limiting only the number of input strings.
+Supported pooling modes are CLS, mean, max, mean-sqrt-length, weighted mean, and
+last token. Query/document prompts, optional Dense heads, L2 normalization,
+pinned host transfers, CPU fallback, and CLI benchmark entry points are part of
+the same runtime. Two dedicated regression modules currently contain 15 tests
+covering layout parsing, prompts, token-budget batching, native/Hugging Face
+parity, padding-free correctness, state-dict normalization, and metadata reuse.
+
 ### KV cache and scheduling
 
 The block manager provides paged KV allocation. Layer-aware allocation avoids
@@ -190,9 +250,10 @@ prefill admission, decode iteration, and cleanup.
 
 The repository contains custom Triton routines, native CUDA kernels, C++ hot
 path helpers, and PyTorch fallbacks. As of the August 2026 source inventory,
-there are 154 `@triton.jit` routines and 14 native CUDA `__global__` bodies;
-approximately 163 distinct custom GPU launch points are directly identifiable.
-These counts describe source entry points, not an ABI guarantee.
+there are 157 `@triton.jit` routines and 14 native CUDA `__global__` bodies.
+These are source-definition counts, not a count of runtime launches: wrappers,
+autotuned specializations, graph capture, and fallback dispatch make “launch
+point” ambiguous unless a specific workload and counting method are named.
 
 ### MGX and Prophet
 

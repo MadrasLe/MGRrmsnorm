@@ -1841,7 +1841,7 @@ def load_from_hf(
     Supports: LLaMA 2/3, TinyLlama, Mistral, CodeLlama,
               Qwen 2.5, Qwen 3, Gemma 2
               + AWQ INT4 quantized versions
-              + On-the-fly FP8 quantization
+              + Streaming INT8 W8A16 quantization
 
     Args:
         model_name: HuggingFace model ID (e.g., "Qwen/Qwen2.5-7B-Instruct-AWQ")
@@ -1850,7 +1850,8 @@ def load_from_hf(
         cache_dir: HuggingFace cache directory
         n_gpu_layers: Number of layers on GPU (-1=all, 0=none). Rest offloaded.
         offload_dir: Directory for disk offload (None=CPU only)
-        quantize: Quantization mode (None, 'fp8'). FP8 gives 2x compression.
+        quantize: Quantization mode. 'int8' selects streaming INT8 W8A16;
+            'fp8' is a legacy alias for the same INT8 implementation.
 
     Returns:
         MegaGemmLlama model ready for inference

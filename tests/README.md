@@ -8,8 +8,8 @@ harnesses.
 Current source inventory:
 
 - 46 Python test files;
-- approximately 18.7k lines of test code;
-- more than 500 functions named `test_*`;
+- approximately 18.5k lines of test code;
+- 512 functions named `test_*`;
 - CPU-safe unit tests, GPU kernel tests, model integration tests, and remote
   hardware harnesses.
 
