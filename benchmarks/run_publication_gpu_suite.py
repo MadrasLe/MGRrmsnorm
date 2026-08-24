@@ -13,6 +13,7 @@ import json
 import os
 import shlex
 import shutil
+import statistics
 import subprocess
 import sys
 import time
@@ -44,20 +45,15 @@ VARIANTS = {
 }
 
 
-# Conservative dense Gemma 4 eager profile.  It deliberately excludes the
-# A100/A4B MoE-only switches, CUDA Graph capture, and the unproven L4 GQA2
-# override.  Shape-dependent kernels keep their own correctness/performance
-# gates; the audit records which gates actually promoted a fast path.
-GEMMA4_DENSE_FAST_PROFILE = {
-    # Runtime topology.  CUDA Graphs are explicitly disabled: the dense L4
-    # graph path is not token-exact, and the measured speedup came from flat
-    # eager decode rather than graph replay.
+# Settings shared only where E2B and E4B have the same measured behavior.
+# The checkpoint-specific profiles below deliberately keep scheduler and
+# RMSNorm decisions separate: E2B is 35L/1536H/GQA8 with 15 KV layers, while
+# E4B is 42L/2560H/GQA4 with 24 KV layers.  Treating them as one runtime profile
+# caused a severe E2B regression that a structural-only audit failed to catch.
+GEMMA4_DENSE_COMMON_PROFILE = {
     "MEGAGEMM_FLAT_DECODE": "1",
-    "MEGAGEMM_DISABLE_CUDA_RMSNORM": "0",
     "MEGAGEMM_DECODE_CUDA_GRAPHS": "0",
     "MEGAGEMM_DECODE_CUDA_GRAPHS_PREFER_STEP": "0",
-    "MEGAGEMM_REUSE_REQUEST_SCHEDULER": "1",
-    # Dense decode kernels and fused tails.
     "MEGAGEMM_FUSED_ROPE_ATTN": "1",
     "MEGAGEMM_FAST_GEMV": "1",
     "MEGAGEMM_DEEPFUSION_MLP": "1",
@@ -66,7 +62,6 @@ GEMMA4_DENSE_FAST_PROFILE = {
     "MEGAGEMM_GEMMA4_DEEPFUSION_MLP_DECODE": "1",
     "MEGAGEMM_FUSED_LM_HEAD_ARGMAX_DECODE": "1",
     "MEGAGEMM_FUSED_RMSNORM_LM_HEAD_ARGMAX_DECODE": "1",
-    # Dense prefill paths.  Their shape gates remain authoritative.
     "MEGAGEMM_GEMMA4_IMPLICIT_CAUSAL_PREFILL": "1",
     "MEGAGEMM_GEMMA4_LONG_SLIDING_PREFILL": "1",
     "MEGAGEMM_GEMMA4_LONG_FULL_PREFILL": "1",
@@ -77,9 +72,78 @@ GEMMA4_DENSE_FAST_PROFILE = {
 }
 
 
+# Preserve E2B's measured L4 path: multi-step eager decode, Triton RMSNorm,
+# and request-local schedulers.  The shared E4B settings are not safe here.
+GEMMA4_E2B_FAST_PROFILE = {
+    **GEMMA4_DENSE_COMMON_PROFILE,
+    "MEGAGEMM_DISABLE_CUDA_RMSNORM": "1",
+    "MEGAGEMM_DECODE_PREFER_STEP": "0",
+    "MEGAGEMM_REUSE_REQUEST_SCHEDULER": "0",
+}
+
+
+# E4B benefits from the native CUDA RMSNorm and one-token scheduler route.
+GEMMA4_E4B_FAST_PROFILE = {
+    **GEMMA4_DENSE_COMMON_PROFILE,
+    "MEGAGEMM_DISABLE_CUDA_RMSNORM": "0",
+    "MEGAGEMM_DECODE_PREFER_STEP": "1",
+    "MEGAGEMM_REUSE_REQUEST_SCHEDULER": "1",
+}
+
+
 MEGAGEMM_PROFILES = {
     "none": {},
-    "gemma4-dense-fast": GEMMA4_DENSE_FAST_PROFILE,
+    "gemma4-e2b-fast": GEMMA4_E2B_FAST_PROFILE,
+    "gemma4-e4b-fast": GEMMA4_E4B_FAST_PROFILE,
+}
+
+
+GEMMA4_PROFILE_REQUIREMENTS = {
+    "gemma4-e2b-fast": {
+        "model_marker": "e2b",
+        "prefer_step": False,
+        "reuse_scheduler": False,
+        "topology": {
+            "num_hidden_layers": 35,
+            "hidden_size": 1536,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 1,
+            "num_kv_shared_layers": 20,
+            "kv_cache_layers": 15,
+            "sliding_attention_layers": 28,
+            "full_attention_layers": 7,
+        },
+        # Conservative regression floors derived from the validated L4/BF16
+        # publication run (about 28/211/25/110 tok/s).  They are deliberately
+        # low enough for run-to-run variance but reject the broken 4/27 path.
+        "l4_bf16_floors": {
+            ("single", 1, 128): 15.0,
+            ("batch", 8, 128): 120.0,
+            ("long_context", 1, 2048): 14.0,
+            ("long_context", 8, 2048): 65.0,
+        },
+    },
+    "gemma4-e4b-fast": {
+        "model_marker": "e4b",
+        "prefer_step": True,
+        "reuse_scheduler": True,
+        "topology": {
+            "num_hidden_layers": 42,
+            "hidden_size": 2560,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 2,
+            "num_kv_shared_layers": 18,
+            "kv_cache_layers": 24,
+            "sliding_attention_layers": 35,
+            "full_attention_layers": 7,
+        },
+        "l4_bf16_floors": {
+            ("single", 1, 128): 12.0,
+            ("batch", 8, 128): 90.0,
+            ("long_context", 1, 2048): 11.0,
+            ("long_context", 8, 2048): 45.0,
+        },
+    },
 }
 
 
@@ -87,22 +151,21 @@ def resolve_megagemm_profile(requested: str, model: str) -> str:
     if requested != "auto":
         return requested
     normalized = model.lower()
-    if "gemma-4-" in normalized and any(
-        size in normalized for size in ("e2b", "e4b")
-    ):
-        return "gemma4-dense-fast"
+    if "gemma-4-" in normalized and "e2b" in normalized:
+        return "gemma4-e2b-fast"
+    if "gemma-4-" in normalized and "e4b" in normalized:
+        return "gemma4-e4b-fast"
     return "none"
 
 
 def profile_environment(profile: str, model: str) -> dict[str, str]:
-    env = dict(MEGAGEMM_PROFILES[profile])
-    if profile == "gemma4-dense-fast":
-        # E4B's decode_multi_step route is currently much slower than its flat
-        # decode_step route.  E2B keeps the already-fast multi-step scheduler.
-        env["MEGAGEMM_DECODE_PREFER_STEP"] = (
-            "1" if "e4b" in model.lower() else "0"
+    requirement = GEMMA4_PROFILE_REQUIREMENTS.get(profile)
+    if requirement and requirement["model_marker"] not in model.lower():
+        raise ValueError(
+            f"profile {profile!r} is not valid for model {model!r}; "
+            "use --megagemm-profile auto"
         )
-    return env
+    return dict(MEGAGEMM_PROFILES[profile])
 
 
 def child_environment(
@@ -112,7 +175,7 @@ def child_environment(
 ) -> dict[str, str]:
     env = os.environ.copy()
     if variant.backend == "megagemm":
-        if profile == "gemma4-dense-fast":
+        if profile in GEMMA4_PROFILE_REQUIREMENTS:
             # Deterministic cuBLAS workspaces were copied from a separate A100
             # validation harness and are not part of the dense L4 speed path.
             env.pop("CUBLAS_WORKSPACE_CONFIG", None)
@@ -260,8 +323,11 @@ def _max_counter(stats: list[dict], key: str) -> int:
     return max((int(item.get(key, 0) or 0) for item in stats), default=0)
 
 
-def audit_gemma4_dense_fast_path(path: Path, model: str) -> dict:
-    """Prove that the required fast runtime was used, then report gated kernels."""
+def audit_gemma4_dense_fast_path(path: Path, profile: str) -> dict:
+    """Validate checkpoint topology, runtime route, and known L4 performance."""
+    requirement = GEMMA4_PROFILE_REQUIREMENTS.get(profile)
+    if requirement is None:
+        raise ValueError(f"profile {profile!r} has no Gemma 4 fast-path audit")
     rows = [
         json.loads(line)
         for line in path.read_text(encoding="utf-8").splitlines()
@@ -302,7 +368,13 @@ def audit_gemma4_dense_fast_path(path: Path, model: str) -> dict:
         for item in decode_stats
         if isinstance(item.get("paged_decode_runtime"), dict)
     ]
-    prefer_step = "e4b" in model.lower()
+    topology_stats = [
+        row.get("model_topology")
+        for row in successful
+        if isinstance(row.get("model_topology"), dict)
+    ]
+    prefer_step = bool(requirement["prefer_step"])
+    expected_reuse = bool(requirement["reuse_scheduler"])
 
     errors: list[str] = []
     if failed:
@@ -314,6 +386,33 @@ def audit_gemma4_dense_fast_path(path: Path, model: str) -> dict:
         )
     if len(decode_stats) != len(successful):
         errors.append("decode_runtime_stats missing from one or more rows")
+    if len(topology_stats) != len(successful):
+        errors.append("model_topology missing from one or more rows")
+    expected_topology = dict(requirement["topology"])
+    topology_mismatches: dict[str, list[object]] = {}
+    for key, expected in expected_topology.items():
+        actual_values = sorted(
+            {item.get(key) for item in topology_stats},
+            key=lambda value: str(value),
+        )
+        if actual_values != [expected]:
+            topology_mismatches[key] = actual_values
+    if topology_mismatches:
+        details = ", ".join(
+            f"{key}={actual!r} (expected {expected_topology[key]!r})"
+            for key, actual in topology_mismatches.items()
+        )
+        errors.append(f"checkpoint topology does not match {profile}: {details}")
+    model_marker = str(requirement["model_marker"])
+    row_models = {
+        str(row.get("model")).lower()
+        for row in successful
+        if row.get("model")
+    }
+    if row_models and any(model_marker not in model for model in row_models):
+        errors.append(
+            f"benchmark rows do not match the {profile} checkpoint family"
+        )
     if decode_stats and not all(item.get("flat_decode_ready") for item in decode_stats):
         reasons = sorted(
             {
@@ -362,10 +461,61 @@ def audit_gemma4_dense_fast_path(path: Path, model: str) -> dict:
         if multi_step_batches > 0:
             errors.append("E4B unexpectedly used the slow decode_multi_step route")
     elif multi_step_batches <= 0:
-        errors.append("dense Gemma multi-step route was never exercised")
+        errors.append("E2B flat decode_multi_step route was never exercised")
+
+    request_scheduler_reuse_count = _max_counter(
+        graph_stats, "request_scheduler_reuse_count"
+    )
+    if expected_reuse and request_scheduler_reuse_count <= 0:
+        errors.append("E4B request scheduler reuse was never exercised")
+    if not expected_reuse and request_scheduler_reuse_count > 0:
+        errors.append("E2B unexpectedly reused the E4B request scheduler path")
+
+    performance_gate = {
+        "applicable": False,
+        "hardware": None,
+        "dtype": None,
+        "measurements": {},
+        "floors": {},
+    }
+    hardware_values = {
+        str(row.get("hardware_label") or "").lower() for row in successful
+    }
+    dtype_values = {str(row.get("dtype") or "").lower() for row in successful}
+    if (
+        hardware_values
+        and all("l4" in value for value in hardware_values)
+        and dtype_values == {"bf16"}
+    ):
+        performance_gate["applicable"] = True
+        performance_gate["hardware"] = sorted(hardware_values)
+        performance_gate["dtype"] = "bf16"
+        floors = dict(requirement["l4_bf16_floors"])
+        for key, floor in floors.items():
+            scenario, batch_size, prompt_tokens = key
+            values = [
+                float(row.get("output_tps", 0.0) or 0.0)
+                for row in successful
+                if str(row.get("scenario")) == scenario
+                and int(row.get("batch_size", 0) or 0) == batch_size
+                and int(row.get("prompt_tokens_requested_per_request", 0) or 0)
+                == prompt_tokens
+            ]
+            label = f"{scenario}/b{batch_size}/p{prompt_tokens}"
+            performance_gate["floors"][label] = floor
+            if not values:
+                continue
+            measured = float(statistics.median(values))
+            performance_gate["measurements"][label] = measured
+            if measured < floor:
+                errors.append(
+                    f"L4 BF16 regression gate failed for {label}: "
+                    f"{measured:.2f} < {floor:.2f} tok/s"
+                )
 
     report = {
         "status": "failed" if errors else "passed",
+        "profile": profile,
         "raw_jsonl": str(path),
         "successful_rows": len(successful),
         "failed_rows": len(failed),
@@ -385,10 +535,12 @@ def audit_gemma4_dense_fast_path(path: Path, model: str) -> dict:
             "decode_cuda_graph_captures": graph_captures,
             "decode_cuda_graph_replays": graph_replays,
             "decode_cuda_graph_failures": graph_failures,
-            "request_scheduler_reuse_count": _max_counter(
-                graph_stats, "request_scheduler_reuse_count"
-            ),
+            "request_scheduler_reuse_expected": expected_reuse,
+            "request_scheduler_reuse_count": request_scheduler_reuse_count,
         },
+        "expected_topology": expected_topology,
+        "observed_topology": topology_stats[0] if topology_stats else None,
+        "performance_gate": performance_gate,
         # These are performance-gated.  Zero means the profile requested the
         # path but its kernel gate rejected this exact model/batch/GPU shape.
         "selected_kernel_counters": {
@@ -485,8 +637,8 @@ def main() -> int:
         choices=["auto", *MEGAGEMM_PROFILES],
         default="auto",
         help=(
-            "MegaGemm child-process profile. auto enables gemma4-dense-fast "
-            "for Gemma 4 E2B/E4B and otherwise selects none."
+            "MegaGemm child-process profile. auto selects the distinct "
+            "gemma4-e2b-fast or gemma4-e4b-fast path and otherwise selects none."
         ),
     )
     parser.add_argument("--max-seq-len", type=int, default=4096)
@@ -505,7 +657,7 @@ def main() -> int:
     megagemm_profile = resolve_megagemm_profile(args.megagemm_profile, args.model)
     effective_warmup = max(args.warmup, 3) if megagemm_profile != "none" else args.warmup
     effective_max_seq_len = args.max_seq_len
-    if megagemm_profile == "gemma4-dense-fast":
+    if megagemm_profile in GEMMA4_PROFILE_REQUIREMENTS:
         max_prompt_tokens = max(
             int(part.strip())
             for part in args.prompt_tokens.split(",")
@@ -580,11 +732,16 @@ def main() -> int:
             check=True,
             env=child_environment(variant, megagemm_profile, args.model),
         )
-        if variant.backend == "megagemm" and megagemm_profile == "gemma4-dense-fast":
+        if (
+            variant.backend == "megagemm"
+            and megagemm_profile in GEMMA4_PROFILE_REQUIREMENTS
+        ):
             variant_raw_path = raw_path(
                 run_dir, run_id, hardware_label, variant
             )
-            audit = audit_gemma4_dense_fast_path(variant_raw_path, args.model)
+            audit = audit_gemma4_dense_fast_path(
+                variant_raw_path, megagemm_profile
+            )
             audit_path = run_dir / f"fastpath_audit_{variant.name}.json"
             audit_path.write_text(json.dumps(audit, indent=2), encoding="utf-8")
             manifest["fastpath_audits"][variant.name] = audit

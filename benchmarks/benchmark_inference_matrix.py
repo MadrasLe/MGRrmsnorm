@@ -376,6 +376,44 @@ def run_checked(
 def megagemm_diagnostics(engine) -> dict[str, Any]:
     model = getattr(engine, "model", None)
     diagnostics: dict[str, Any] = {}
+    config = getattr(model, "config", None)
+    if config is not None:
+        layer_types = list(getattr(config, "layer_types", ()) or ())
+        kv_cache_layers = list(
+            getattr(config, "kv_cache_layer_indices", ()) or ()
+        )
+        diagnostics["model_topology"] = {
+            "model_type": str(getattr(config, "model_type", "") or ""),
+            "num_hidden_layers": int(
+                getattr(config, "num_hidden_layers", 0) or 0
+            ),
+            "hidden_size": int(getattr(config, "hidden_size", 0) or 0),
+            "num_attention_heads": int(
+                getattr(config, "num_attention_heads", 0) or 0
+            ),
+            "num_key_value_heads": int(
+                getattr(config, "num_key_value_heads", 0) or 0
+            ),
+            "num_kv_shared_layers": int(
+                getattr(config, "num_kv_shared_layers", 0) or 0
+            ),
+            "kv_cache_layers": len(kv_cache_layers),
+            "sliding_attention_layers": layer_types.count(
+                "sliding_attention"
+            ),
+            "full_attention_layers": layer_types.count("full_attention"),
+            "linear_attention_layers": layer_types.count(
+                "linear_attention"
+            ),
+            "head_dims": sorted(
+                {
+                    int(value)
+                    for value in (
+                        getattr(config, "per_layer_head_dims", ()) or ()
+                    )
+                }
+            ),
+        }
     runtime_stats = getattr(model, "decode_runtime_stats", None)
     if callable(runtime_stats):
         try:
@@ -661,6 +699,13 @@ def write_outputs(args: argparse.Namespace, rows: list[dict[str, Any]]) -> tuple
                     "CUDA_VISIBLE_DEVICES",
                     "MEGAGEMM_FLAT_DECODE",
                     "MEGAGEMM_DISABLE_CUDA_RMSNORM",
+                    "MEGAGEMM_DECODE_PREFER_STEP",
+                    "MEGAGEMM_DECODE_CUDA_GRAPHS",
+                    "MEGAGEMM_DECODE_CUDA_GRAPHS_PREFER_STEP",
+                    "MEGAGEMM_REUSE_REQUEST_SCHEDULER",
+                    "MEGAGEMM_GEMMA4_FUSED_QKV_DECODE",
+                    "MEGAGEMM_GEMMA4_FUSED_GATEUP_DECODE",
+                    "MEGAGEMM_GEMMA4_DEEPFUSION_MLP_DECODE",
                     "MEGAGEMM_SKIP_CUDA",
                     "MICROGEMM_CACHE_DIR",
                     "OMP_NUM_THREADS",
