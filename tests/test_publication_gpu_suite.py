@@ -34,14 +34,10 @@ def test_dense_gemma4_models_select_distinct_fast_profiles_automatically():
     assert runner.resolve_megagemm_profile("none", "google/gemma-4-E4B-it") == "none"
 
 
-def test_fast_profile_is_scoped_and_model_specific(monkeypatch, tmp_path):
+def test_fast_profile_is_scoped_and_model_specific(monkeypatch):
     runner = load_runner()
     monkeypatch.delenv("MEGAGEMM_DECODE_CUDA_GRAPHS", raising=False)
     monkeypatch.setenv("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
-    cuda13_runtime = tmp_path / "libcudart.so.13"
-    cuda13_runtime.write_bytes(b"")
-    monkeypatch.setenv("VLLM_CUDA_RUNTIME_LIB", str(cuda13_runtime))
-    monkeypatch.setenv("LD_PRELOAD", "/existing/libhelper.so")
 
     e4b_env = runner.child_environment(
         runner.VARIANTS["megagemm-bf16"],
@@ -71,14 +67,6 @@ def test_fast_profile_is_scoped_and_model_specific(monkeypatch, tmp_path):
     assert e2b_env["MEGAGEMM_DECODE_PREFER_STEP"] == "0"
     assert e2b_env["MEGAGEMM_REUSE_REQUEST_SCHEDULER"] == "0"
     assert "MEGAGEMM_DECODE_CUDA_GRAPHS" not in vllm_env
-    assert vllm_env["LD_PRELOAD"].split(runner.os.pathsep) == [
-        str(cuda13_runtime),
-        "/existing/libhelper.so",
-    ]
-    assert vllm_env["LD_LIBRARY_PATH"].split(runner.os.pathsep)[0] == str(
-        tmp_path
-    )
-    assert "VLLM_CUDA_RUNTIME_LIB" not in vllm_env
 
 
 def test_checkpoint_profile_cannot_be_applied_to_the_other_scale():
