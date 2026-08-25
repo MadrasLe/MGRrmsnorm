@@ -13,6 +13,11 @@ CANDIDATE_ID="gemma4_dense_tail_candidate_${STAMP}"
 
 cd "$REPO"
 
+# Python uses benchmarks/ as sys.path[0] when these files are executed by
+# pathname.  Make the checkout importable in a fresh Colab runtime without
+# requiring an editable install or compiling optional native extensions.
+export PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}"
+
 GPU_NAME="$(nvidia-smi --query-gpu=name --format=csv,noheader | head -n1)"
 echo "GPU: $GPU_NAME"
 [[ "$GPU_NAME" == *"L4"* ]] || {

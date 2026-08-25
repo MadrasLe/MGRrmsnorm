@@ -98,3 +98,4 @@ def test_candidate_is_not_promoted_without_l4_ab_evidence():
     assert "dense_tail_requested" in publication
     assert "--variants megagemm-bf16" in harness
     assert "vllm-bf16" not in harness
+    assert 'export PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}"' in harness
