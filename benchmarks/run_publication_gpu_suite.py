@@ -357,6 +357,30 @@ def validate_existing_variant_artifacts(
         )
 
 
+def raw_artifact_errors(path: Path) -> list[str]:
+    """Return publication-blocking errors recorded in a backend JSONL."""
+    try:
+        rows = [
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+    except Exception as exc:
+        return [f"could not read raw artifact: {type(exc).__name__}: {exc}"]
+    if not rows:
+        return ["raw artifact contains no rows"]
+    failed = [row for row in rows if not row.get("ok")]
+    if not failed:
+        return []
+    reasons = sorted(
+        {str(row.get("error") or "unknown backend failure") for row in failed}
+    )
+    return [
+        f"{len(failed)}/{len(rows)} benchmark row(s) failed: "
+        + "; ".join(reasons)
+    ]
+
+
 def _max_counter(stats: list[dict], key: str) -> int:
     return max((int(item.get(key, 0) or 0) for item in stats), default=0)
 
@@ -782,12 +806,13 @@ def main() -> int:
         variant_summary_path = summary_path(
             run_dir, run_id, hardware_label, variant
         )
-        reuse_existing = bool(
+        existing_artifacts = bool(
             args.resume_existing
             and variant_raw_path.exists()
             and variant_summary_path.exists()
         )
-        if reuse_existing:
+        existing_errors: list[str] = []
+        if existing_artifacts:
             validate_existing_variant_artifacts(
                 variant_summary_path,
                 args=args,
@@ -796,17 +821,32 @@ def main() -> int:
                 warmup=effective_warmup,
                 max_seq_len=effective_max_seq_len,
             )
+            existing_errors = raw_artifact_errors(variant_raw_path)
+        reuse_existing = bool(existing_artifacts and not existing_errors)
+        if reuse_existing:
             print(
                 f"  resume: reusing matching artifacts for {variant.name}",
                 flush=True,
             )
         else:
+            if existing_errors:
+                print(
+                    f"  resume: rerunning {variant.name}; existing artifact "
+                    f"is incomplete ({' | '.join(existing_errors)})",
+                    flush=True,
+                )
             subprocess.run(
                 command,
                 cwd=ROOT,
                 check=True,
                 env=child_environment(variant, megagemm_profile, args.model),
             )
+            produced_errors = raw_artifact_errors(variant_raw_path)
+            if produced_errors:
+                raise RuntimeError(
+                    f"{variant.name} did not produce a valid publication "
+                    f"artifact: {' | '.join(produced_errors)}"
+                )
         if (
             variant.backend == "megagemm"
             and megagemm_profile in GEMMA4_PROFILE_REQUIREMENTS

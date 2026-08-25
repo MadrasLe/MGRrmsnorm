@@ -336,3 +336,24 @@ def test_resume_rejects_a_summary_from_a_different_workload(tmp_path):
         assert "max_new_tokens" in str(exc)
     else:
         raise AssertionError("stale benchmark summary was reused")
+
+
+def test_failed_raw_artifact_is_not_reusable(tmp_path):
+    runner = load_runner()
+    raw_path = tmp_path / "vllm.jsonl"
+    raw_path.write_text(
+        json.dumps(
+            {
+                "ok": False,
+                "error": "ModuleNotFoundError: No module named 'vllm'",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    errors = runner.raw_artifact_errors(raw_path)
+
+    assert len(errors) == 1
+    assert "1/1 benchmark row(s) failed" in errors[0]
+    assert "No module named 'vllm'" in errors[0]
