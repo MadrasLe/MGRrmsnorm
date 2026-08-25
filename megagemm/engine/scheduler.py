@@ -22,6 +22,7 @@ from typing import Dict, List, Optional, Callable, Sequence, Union
 
 from .kv_cache import BlockManager
 from .sampling import sample_logits
+from ..models.runtime_policy import policy_bool
 
 __all__ = ['Request', 'RequestStatus', 'Scheduler']
 
@@ -225,8 +226,11 @@ class Scheduler:
         self.device = device
         self._prefill_capture_hook = prefill_capture_hook
         self._materialize_generated_tokens = bool(materialize_generated_tokens)
-        self._request_scheduler_reuse_enabled = _env_bool(
-            "MEGAGEMM_REUSE_REQUEST_SCHEDULER", default=False,
+        self._request_scheduler_reuse_enabled = policy_bool(
+            model,
+            "MEGAGEMM_REUSE_REQUEST_SCHEDULER",
+            "reuse_request_scheduler",
+            default=False,
         )
         self._request_scheduler_env_signature = _request_scheduler_env_signature()
         self._request_scheduler_reused = False
@@ -238,8 +242,11 @@ class Scheduler:
         # Select the regular one-token decode path independently from CUDA
         # Graphs.  Some model/GPU combinations are faster in the flat
         # decode_step path even when graph capture is intentionally disabled.
-        self._decode_prefer_step = _env_bool(
-            "MEGAGEMM_DECODE_PREFER_STEP", default=False,
+        self._decode_prefer_step = policy_bool(
+            model,
+            "MEGAGEMM_DECODE_PREFER_STEP",
+            "decode_prefer_step",
+            default=False,
         )
         self._decode_step_batches = 0
         self._decode_multi_step_batches = 0

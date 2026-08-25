@@ -49,12 +49,14 @@ try:
         rmsnorm_triton,
         rmsnorm_triton_no_weight,
         rmsnorm_triton_scaled_no_weight,
+        rmsnorm_triton_residual_scale_next,
         HAS_TRITON_RMSNORM,
     )
 except Exception:
     rmsnorm_triton = None
     rmsnorm_triton_no_weight = None
     rmsnorm_triton_scaled_no_weight = None
+    rmsnorm_triton_residual_scale_next = None
     HAS_TRITON_RMSNORM = False
 
 # Gemma4 short-prefill Q/K/V norm + RoPE + layout preparation.
@@ -145,6 +147,7 @@ __all__ = [
     'RMSNorm', 'RMSNormFunction',
     'rmsnorm_triton', 'rmsnorm_triton_no_weight',
     'rmsnorm_triton_scaled_no_weight', 'HAS_TRITON_RMSNORM',
+    'rmsnorm_triton_residual_scale_next',
     'gemma4_prefill_attention_prepare', 'HAS_GEMMA4_ATTENTION_PREPARE',
     'MegaGemmTriton', 'MegaGemmFunction',
     'RoPE', 'apply_rotary_emb', 'precompute_freqs_cis',

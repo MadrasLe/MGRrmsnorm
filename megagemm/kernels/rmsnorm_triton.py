@@ -31,6 +31,7 @@ __all__ = [
     "rmsnorm_triton_add",
     "rmsnorm_triton_pair_add_final",
     "rmsnorm_triton_pair_add_final_residual",
+    "rmsnorm_triton_residual_scale_next",
     "rmsnorm_triton_weighted_scaled_no_weight_dual",
     "rmsnorm_triton_no_weight",
     "rmsnorm_triton_scaled_no_weight",
@@ -92,6 +93,88 @@ if _HAS_TRITON:
         else:
             out = x * inv_rms
         tl.store(out_ptr + out_row_off + safe_cols, out, mask=mask)
+
+    @triton.jit
+    def _rmsnorm_residual_scale_next_kernel(
+        branch_ptr,
+        residual_ptr,
+        norm_weight_ptr,
+        layer_scalar_ptr,
+        next_norm_weight_ptr,
+        hidden_out_ptr,
+        next_norm_out_ptr,
+        n_cols,
+        branch_stride_row,
+        residual_stride_row,
+        hidden_stride_row,
+        next_stride_row,
+        eps,
+        NORM_OFFSET: tl.constexpr,
+        APPLY_LAYER_SCALE: tl.constexpr,
+        WRITE_NEXT_NORM: tl.constexpr,
+        NEXT_NORM_OFFSET: tl.constexpr,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        row = tl.program_id(0)
+        cols = tl.arange(0, BLOCK_SIZE)
+        mask = cols < n_cols
+        safe_cols = tl.minimum(cols, n_cols - 1)
+
+        branch = tl.load(
+            branch_ptr + row * branch_stride_row + safe_cols,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        branch_var = tl.sum(branch * branch, axis=0) / n_cols
+        norm_weight = tl.load(
+            norm_weight_ptr + safe_cols,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        if NORM_OFFSET:
+            norm_weight += 1.0
+        # Preserve the eager RMSNorm materialization before the residual add.
+        branch_norm = (
+            branch * (1.0 / tl.sqrt(branch_var + eps)) * norm_weight
+        ).to(hidden_out_ptr.dtype.element_ty)
+        residual = tl.load(
+            residual_ptr + row * residual_stride_row + safe_cols,
+            mask=mask,
+            other=0.0,
+        )
+        hidden = (residual + branch_norm).to(hidden_out_ptr.dtype.element_ty)
+
+        if APPLY_LAYER_SCALE:
+            scalar = tl.load(layer_scalar_ptr).to(tl.float32)
+            hidden = (hidden.to(tl.float32) * scalar).to(
+                hidden_out_ptr.dtype.element_ty
+            )
+        tl.store(
+            hidden_out_ptr + row * hidden_stride_row + safe_cols,
+            hidden,
+            mask=mask,
+        )
+
+        if WRITE_NEXT_NORM:
+            hidden_f32 = hidden.to(tl.float32)
+            hidden_var = tl.sum(hidden_f32 * hidden_f32, axis=0) / n_cols
+            next_weight = tl.load(
+                next_norm_weight_ptr + safe_cols,
+                mask=mask,
+                other=0.0,
+            ).to(tl.float32)
+            if NEXT_NORM_OFFSET:
+                next_weight += 1.0
+            next_norm = (
+                hidden_f32
+                * (1.0 / tl.sqrt(hidden_var + eps))
+                * next_weight
+            )
+            tl.store(
+                next_norm_out_ptr + row * next_stride_row + safe_cols,
+                next_norm,
+                mask=mask,
+            )
 
     @triton.jit
     def _rmsnorm_scaled_no_weight_kernel(
@@ -1175,6 +1258,118 @@ def rmsnorm_triton_add(
         num_warps=num_warps,
     )
     return out.reshape_as(lhs)
+
+
+def rmsnorm_triton_residual_scale_next(
+    branch: torch.Tensor,
+    residual: torch.Tensor,
+    norm_weight: torch.Tensor,
+    layer_scalar: torch.Tensor,
+    next_norm_weight: Optional[torch.Tensor],
+    eps: float = 1e-5,
+    *,
+    norm_offset: bool = False,
+    next_norm_offset: bool = False,
+    out_hidden: Optional[torch.Tensor] = None,
+    next_norm_out: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Fuse a Gemma branch norm, residual add, layer scale, and next norm."""
+    if branch.shape != residual.shape:
+        raise ValueError("branch and residual must have the same shape")
+    n_cols = int(branch.shape[-1])
+    if int(norm_weight.numel()) != n_cols:
+        raise ValueError("norm weight must match the last dimension")
+    if int(layer_scalar.numel()) != 1:
+        raise ValueError("layer scalar must contain exactly one value")
+    if next_norm_weight is not None and int(next_norm_weight.numel()) != n_cols:
+        raise ValueError("next norm weight must match the last dimension")
+    if branch.device != residual.device or branch.dtype != residual.dtype:
+        raise ValueError("branch and residual must share device and dtype")
+    if out_hidden is not None:
+        if out_hidden.shape != branch.shape:
+            raise ValueError("out_hidden must match the branch shape")
+        if out_hidden.device != branch.device or out_hidden.dtype != branch.dtype:
+            raise ValueError("out_hidden must share branch device and dtype")
+    if next_norm_out is not None:
+        if next_norm_weight is None:
+            raise ValueError("next_norm_out requires next_norm_weight")
+        if next_norm_out.shape != branch.shape:
+            raise ValueError("next_norm_out must match the branch shape")
+        if next_norm_out.device != branch.device or next_norm_out.dtype != branch.dtype:
+            raise ValueError("next_norm_out must share branch device and dtype")
+
+    write_next_norm = next_norm_weight is not None
+    hidden_out = torch.empty_like(branch) if out_hidden is None else out_hidden
+    if write_next_norm:
+        next_out = (
+            torch.empty_like(branch) if next_norm_out is None else next_norm_out
+        )
+    else:
+        next_out = None
+
+    weights_cuda = bool(
+        norm_weight.is_cuda
+        and layer_scalar.is_cuda
+        and (next_norm_weight is None or next_norm_weight.is_cuda)
+    )
+    eligible = bool(
+        _HAS_TRITON
+        and branch.is_cuda
+        and residual.is_cuda
+        and weights_cuda
+        and branch.stride(-1) == 1
+        and residual.stride(-1) == 1
+        and hidden_out.stride(-1) == 1
+        and (next_out is None or next_out.stride(-1) == 1)
+        and norm_weight.is_contiguous()
+        and layer_scalar.is_contiguous()
+        and (next_norm_weight is None or next_norm_weight.is_contiguous())
+        and 0 < n_cols <= 8192
+    )
+    if not eligible:
+        branch_norm = _pytorch_rmsnorm(branch, norm_weight, eps, norm_offset)
+        hidden = (residual + branch_norm).to(branch.dtype)
+        hidden = (hidden * layer_scalar.to(hidden.dtype)).to(hidden.dtype)
+        hidden_out.copy_(hidden)
+        if next_norm_weight is not None:
+            next_value = _pytorch_rmsnorm(
+                hidden_out,
+                next_norm_weight,
+                eps,
+                next_norm_offset,
+            )
+            next_out.copy_(next_value)
+        return hidden_out, next_out
+
+    branch_2d = branch.reshape(-1, n_cols)
+    residual_2d = residual.reshape(-1, n_cols)
+    hidden_2d = hidden_out.reshape(-1, n_cols)
+    next_2d = hidden_2d if next_out is None else next_out.reshape(-1, n_cols)
+    next_weight = norm_weight if next_norm_weight is None else next_norm_weight
+    block_size = triton.next_power_of_2(n_cols)
+    num_warps = min(8, max(1, block_size // 256))
+    _rmsnorm_residual_scale_next_kernel[(branch_2d.shape[0],)](
+        branch_2d,
+        residual_2d,
+        norm_weight,
+        layer_scalar,
+        next_weight,
+        hidden_2d,
+        next_2d,
+        n_cols,
+        branch_2d.stride(0),
+        residual_2d.stride(0),
+        hidden_2d.stride(0),
+        next_2d.stride(0),
+        eps,
+        NORM_OFFSET=bool(norm_offset),
+        APPLY_LAYER_SCALE=True,
+        WRITE_NEXT_NORM=bool(write_next_norm),
+        NEXT_NORM_OFFSET=bool(next_norm_offset),
+        BLOCK_SIZE=block_size,
+        num_warps=num_warps,
+    )
+    return hidden_out, next_out
 
 
 def rmsnorm_triton_pair_add_final(

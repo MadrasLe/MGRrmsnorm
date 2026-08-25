@@ -536,6 +536,24 @@ def audit_gemma4_dense_fast_path(path: Path, profile: str) -> dict:
     if not expected_reuse and request_scheduler_reuse_count > 0:
         errors.append("E2B unexpectedly reused the E4B request scheduler path")
 
+    dense_tail_requested = os.environ.get(
+        "MEGAGEMM_GEMMA4_DENSE_POST_NORM_CHAIN_DECODE", "0"
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    dense_tail_enabled = bool(
+        decode_stats
+        and all(
+            item.get("gemma4_dense_post_norm_chain_decode_enabled")
+            for item in decode_stats
+        )
+    )
+    dense_tail_hits = _max_counter(
+        decode_stats, "gemma4_dense_post_norm_chain_decode_hits"
+    )
+    if dense_tail_requested and not dense_tail_enabled:
+        errors.append("requested Gemma 4 dense post-norm chain was not enabled")
+    if dense_tail_requested and dense_tail_hits <= 0:
+        errors.append("requested Gemma 4 dense post-norm chain was never exercised")
+
     performance_gate = {
         "applicable": False,
         "hardware": None,
@@ -630,6 +648,12 @@ def audit_gemma4_dense_fast_path(path: Path, profile: str) -> dict:
             ),
             "gemma4_flat_deepfusion": _max_counter(
                 decode_stats, "gemma4_flat_deepfusion_hits"
+            ),
+            "gemma4_dense_post_norm_chain": _max_counter(
+                decode_stats, "gemma4_dense_post_norm_chain_decode_hits"
+            ),
+            "gemma4_dense_next_attn_norm": _max_counter(
+                decode_stats, "gemma4_dense_next_attn_norm_decode_hits"
             ),
             "gemma4_fused_dual_ffn_norm_prefill": _max_counter(
                 decode_stats, "gemma4_fused_dual_ffn_norm_prefill_hits"

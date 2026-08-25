@@ -22,6 +22,7 @@ import torch
 import torch.nn as nn
 
 from .sparsity import is_semi_structured_weight
+from .runtime_policy import resolve_runtime_policy
 
 try:
     from ..kernels.sparse24_mma import (
@@ -131,6 +132,7 @@ try:
         rmsnorm_triton_no_weight,
         rmsnorm_triton_pair_add_final,
         rmsnorm_triton_pair_add_final_residual,
+        rmsnorm_triton_residual_scale_next,
         rmsnorm_triton_scaled_no_weight,
         rmsnorm_triton_weighted_scaled_no_weight_dual,
     )
@@ -145,6 +147,7 @@ except Exception:
     rmsnorm_triton_no_weight = None
     rmsnorm_triton_pair_add_final = None
     rmsnorm_triton_pair_add_final_residual = None
+    rmsnorm_triton_residual_scale_next = None
     rmsnorm_triton_scaled_no_weight = None
     rmsnorm_triton_weighted_scaled_no_weight_dual = None
     _HAS_TRITON_RMSNORM = False
@@ -645,6 +648,10 @@ _GEMMA4_FUSED_GATEUP_DECODE = _env_enabled(
 )
 _GEMMA4_DEEPFUSION_MLP_DECODE = _env_enabled(
     "MEGAGEMM_GEMMA4_DEEPFUSION_MLP_DECODE", default=True
+)
+_GEMMA4_DENSE_POST_NORM_CHAIN_DECODE = _env_enabled(
+    # Experimental until a same-session E2B/E4B L4 A/B proves wall-time gain.
+    "MEGAGEMM_GEMMA4_DENSE_POST_NORM_CHAIN_DECODE", default=False
 )
 _GEMMA4_PARALLEL_MOE_DECODE = _env_enabled(
     "MEGAGEMM_GEMMA4_PARALLEL_MOE_DECODE", default=True
@@ -2229,8 +2236,9 @@ def _decode_rmsnorm(
     eps: float,
     offset: bool = False,
     out: Optional[torch.Tensor] = None,
+    prefer_triton: bool = False,
 ) -> torch.Tensor:
-    if _can_use_cuda_rmsnorm_for(x, offset):
+    if not prefer_triton and _can_use_cuda_rmsnorm_for(x, offset):
         try:
             if torch.is_grad_enabled():
                 result = RMSNormFunction.apply(x, weight, eps)
@@ -2810,6 +2818,7 @@ class MGRMSNorm(nn.Module):
     ):
         super().__init__()
         self.with_scale = with_scale
+        self.prefer_triton = False
         if with_scale:
             init = torch.zeros(hidden_size) if offset else torch.ones(hidden_size)
             self.weight = nn.Parameter(init)
@@ -2843,7 +2852,7 @@ class MGRMSNorm(nn.Module):
                 except Exception:
                     pass
             return self._pytorch_forward(x)
-        if _can_use_cuda_rmsnorm_for(x, self.offset):
+        if not self.prefer_triton and _can_use_cuda_rmsnorm_for(x, self.offset):
             try:
                 if torch.is_grad_enabled():
                     return RMSNormFunction.apply(x, self.weight, self.eps)
@@ -10584,6 +10593,8 @@ class MegaGemmLlama(nn.Module):
     def __init__(self, config: LlamaConfig):
         super().__init__()
         self.config = config
+        self.runtime_policy = resolve_runtime_policy(config)
+        self._gemma4_prefer_triton_rmsnorm = False
         if self.config.rotary_dim == 0:
             self.config.rotary_dim = self.config.head_dim
         if not self.config.layer_types:
@@ -10772,6 +10783,10 @@ class MegaGemmLlama(nn.Module):
         self._gemma4_flat_fused_next_attn_norm_hits = 0
         self._gemma4_flat_fused_layer_scalar_hits = 0
         self._gemma4_flat_next_attn_norm_bufs = None
+        self._gemma4_flat_dense_post_norm_chain_enabled = False
+        self._gemma4_flat_dense_post_norm_chain_hits = 0
+        self._gemma4_flat_dense_next_attn_norm_hits = 0
+        self._gemma4_flat_dense_next_attn_norm_bufs = None
         self._gemma4_flat_fused_router_expert_input_norm_enabled = False
         self._gemma4_flat_fused_router_expert_input_norm_hits = 0
         self._gemma4_flat_expert_input_bufs = None
@@ -10930,6 +10945,28 @@ class MegaGemmLlama(nn.Module):
         if device is None:
             device = self.embed_tokens.weight.device
         device = torch.device(device)
+        device_name = ""
+        if device.type == "cuda" and torch.cuda.is_available():
+            try:
+                device_name = torch.cuda.get_device_name(device)
+            except Exception:
+                device_name = ""
+        self.runtime_policy = resolve_runtime_policy(
+            self.config,
+            device_name=device_name,
+        )
+        explicit_rmsnorm = os.environ.get(
+            "MEGAGEMM_DISABLE_CUDA_RMSNORM", ""
+        ).strip()
+        prefer_triton_rmsnorm = (
+            explicit_rmsnorm.lower() in {"1", "true", "yes", "on"}
+            if explicit_rmsnorm
+            else bool(self.runtime_policy.prefer_triton_rmsnorm)
+        )
+        self._gemma4_prefer_triton_rmsnorm = prefer_triton_rmsnorm
+        for module in self.modules():
+            if isinstance(module, MGRMSNorm):
+                module.prefer_triton = prefer_triton_rmsnorm
         if dtype is None:
             dtype = (
                 self.embed_tokens.weight.dtype
@@ -11316,6 +11353,9 @@ class MegaGemmLlama(nn.Module):
                 self._flat_norm_weight,
                 self._flat_norm_eps,
                 self._flat_norm_offset,
+                prefer_triton=bool(
+                    getattr(self, "_gemma4_prefer_triton_rmsnorm", False)
+                ),
             )
             hidden_2d = hidden_norm.reshape(-1, hidden_norm.shape[-1])
             logits = torch.mm(hidden_2d, self._flat_lm_head_wt)
@@ -12941,6 +12981,7 @@ class MegaGemmLlama(nn.Module):
             )
         return {
             "paged_decode_runtime": paged_decode_runtime_stats(),
+            "runtime_policy": self.runtime_policy.to_dict(),
             "mgx_sparsity_runtime": dict(
                 getattr(self, "_mgx_sparsity_runtime", {"active": False, "format": "none"})
             ),
@@ -13772,6 +13813,19 @@ class MegaGemmLlama(nn.Module):
             ),
             "gemma4_flat_deepfusion_hits": int(
                 getattr(self, "_gemma4_flat_deepfusion_hits", 0)
+            ),
+            "gemma4_dense_post_norm_chain_decode_enabled": bool(
+                getattr(
+                    self,
+                    "_gemma4_flat_dense_post_norm_chain_enabled",
+                    False,
+                )
+            ),
+            "gemma4_dense_post_norm_chain_decode_hits": int(
+                getattr(self, "_gemma4_flat_dense_post_norm_chain_hits", 0)
+            ),
+            "gemma4_dense_next_attn_norm_decode_hits": int(
+                getattr(self, "_gemma4_flat_dense_next_attn_norm_hits", 0)
             ),
             "gemma4_parallel_moe_decode_enabled": bool(
                 getattr(self, "_gemma4_flat_parallel_moe_enabled", False)
@@ -15817,6 +15871,29 @@ class MegaGemmLlama(nn.Module):
                 if self._gemma4_flat_fused_next_attn_norm_supported
                 else None
             )
+            self._gemma4_flat_dense_post_norm_chain_enabled = bool(
+                _GEMMA4_DENSE_POST_NORM_CHAIN_DECODE
+                and callable(rmsnorm_triton_residual_scale_next)
+                and self.runtime_policy.name
+                in {"gemma4-e2b-l4", "gemma4-e4b-l4"}
+                and all(
+                    not lw.is_moe and int(lw.layer_scalar.numel()) == 1
+                    for lw in weights
+                )
+            )
+            self._gemma4_flat_dense_next_attn_norm_bufs = (
+                [
+                    torch.empty(
+                        batch_size,
+                        self._flat_hidden_size,
+                        device=device,
+                        dtype=dtype,
+                    )
+                    for _ in weights
+                ]
+                if self._gemma4_flat_dense_post_norm_chain_enabled
+                else None
+            )
             self._gemma4_flat_fused_router_expert_input_norm_enabled = bool(
                 self._gemma4_flat_parallel_moe_enabled
                 and int(batch_size) == 16
@@ -15956,6 +16033,8 @@ class MegaGemmLlama(nn.Module):
             self._gemma4_flat_fused_expert_reduce_post_moe_hits = 0
             self._gemma4_flat_fused_next_attn_norm_hits = 0
             self._gemma4_flat_fused_layer_scalar_hits = 0
+            self._gemma4_flat_dense_post_norm_chain_hits = 0
+            self._gemma4_flat_dense_next_attn_norm_hits = 0
             self._gemma4_flat_fused_router_expert_input_norm_hits = 0
             if self._gemma4_flat_parallel_moe_enabled:
                 self._gemma4_flat_parallel_moe_stream = torch.cuda.Stream(device=device)
@@ -16141,6 +16220,25 @@ class MegaGemmLlama(nn.Module):
             self._gemma4_flat_down_bufs[layer_idx],
         )
 
+    def _gemma4_flat_rmsnorm(
+        self,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+        offset: bool = False,
+        out: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        return _decode_rmsnorm(
+            x,
+            weight,
+            eps,
+            offset,
+            out=out,
+            prefer_triton=bool(
+                getattr(self, "_gemma4_prefer_triton_rmsnorm", False)
+            ),
+        )
+
     def _gemma4_flat_should_use_fused_gateup(
         self,
         hidden: torch.Tensor,
@@ -16215,7 +16313,7 @@ class MegaGemmLlama(nn.Module):
                     out=out,
                 )
                 self._flat_fp_linear(
-                    _decode_rmsnorm(hidden, lw.pre_ff_norm_weight, self._flat_norm_eps, False),
+                    self._gemma4_flat_rmsnorm(hidden, lw.pre_ff_norm_weight, self._flat_norm_eps, False),
                     lw.gate_up_wt,
                     lw.gate_up_bias,
                     out,
@@ -16235,7 +16333,7 @@ class MegaGemmLlama(nn.Module):
                 )
                 base_ms = _cuda_bench_ms(
                     lambda: self._flat_fp_linear(
-                        _decode_rmsnorm(hidden, lw.pre_ff_norm_weight, self._flat_norm_eps, False),
+                        self._gemma4_flat_rmsnorm(hidden, lw.pre_ff_norm_weight, self._flat_norm_eps, False),
                         lw.gate_up_wt,
                         lw.gate_up_bias,
                         out,
@@ -16414,7 +16512,7 @@ class MegaGemmLlama(nn.Module):
                 mlp_input_norm_start_end = _timing_record_start(
                     timing_events is not None
                 )
-                mlp_in = _decode_rmsnorm(
+                mlp_in = self._gemma4_flat_rmsnorm(
                     hidden,
                     lw.pre_ff_norm_weight,
                     norm_eps,
@@ -16526,6 +16624,11 @@ class MegaGemmLlama(nn.Module):
             and self._gemma4_flat_fused_next_attn_norm_enabled
             and self._gemma4_flat_next_attn_norm_bufs is not None
         )
+        dense_post_norm_chain = bool(
+            timing_events is None
+            and self._gemma4_flat_dense_post_norm_chain_enabled
+            and self._gemma4_flat_dense_next_attn_norm_bufs is not None
+        )
 
         for layer_idx, lw in enumerate(self._flat_layer_weights):
             cos, sin = self._get_layer_rope(layer_idx)
@@ -16533,10 +16636,14 @@ class MegaGemmLlama(nn.Module):
 
             residual = hidden
             attn_input_norm_start_end = _timing_record_start(timing_events is not None)
-            if fused_next_attn_norm_chain and layer_idx > 0:
+            if dense_post_norm_chain and layer_idx > 0:
+                normed = self._gemma4_flat_dense_next_attn_norm_bufs[
+                    layer_idx - 1
+                ]
+            elif fused_next_attn_norm_chain and layer_idx > 0:
                 normed = self._gemma4_flat_next_attn_norm_bufs[layer_idx - 1]
             else:
-                normed = _decode_rmsnorm(
+                normed = self._gemma4_flat_rmsnorm(
                     hidden,
                     lw.input_norm_weight,
                     norm_eps,
@@ -16681,7 +16788,7 @@ class MegaGemmLlama(nn.Module):
             else:
                 attn_norm_rope_start_end = _timing_record_start(timing_events is not None)
                 if lw.q_norm_weight is not None:
-                    q = _decode_rmsnorm(q, lw.q_norm_weight, norm_eps, False)
+                    q = self._gemma4_flat_rmsnorm(q, lw.q_norm_weight, norm_eps, False)
                 q4, _ = apply_rotary_emb(
                     q.unsqueeze(2),
                     q.unsqueeze(2),
@@ -16699,7 +16806,7 @@ class MegaGemmLlama(nn.Module):
                     k = k_raw.view(bsz, lw.num_kv_heads, lw.head_dim)
                     v = v_raw.view(bsz, lw.num_kv_heads, lw.head_dim)
                     if lw.k_norm_weight is not None:
-                        k = _decode_rmsnorm(k, lw.k_norm_weight, norm_eps, False)
+                        k = self._gemma4_flat_rmsnorm(k, lw.k_norm_weight, norm_eps, False)
                     if lw.has_v_norm:
                         v = _decode_rmsnorm_no_weight(v, norm_eps)
                     k4, _ = apply_rotary_emb(
@@ -16852,7 +16959,7 @@ class MegaGemmLlama(nn.Module):
                 attn_output_norm_start_end = _timing_record_start(
                     timing_events is not None
                 )
-                attn_normed = _decode_rmsnorm(
+                attn_normed = self._gemma4_flat_rmsnorm(
                     o_out,
                     lw.post_attn_norm_weight,
                     norm_eps,
@@ -16920,7 +17027,7 @@ class MegaGemmLlama(nn.Module):
                         normalized_input=bridge_shared_in,
                     )
                     if not post_moe_chain_fused:
-                        shared_normed = _decode_rmsnorm(
+                        shared_normed = self._gemma4_flat_rmsnorm(
                             down_out,
                             lw.post_shared_norm_weight,
                             norm_eps,
@@ -16980,14 +17087,14 @@ class MegaGemmLlama(nn.Module):
             if lw.is_moe:
                 mlp_output_norm_start_end = _timing_record_start(timing_events is not None)
                 if not parallel_moe:
-                    shared_normed = _decode_rmsnorm(
+                    shared_normed = self._gemma4_flat_rmsnorm(
                         down_out,
                         lw.post_shared_norm_weight,
                         norm_eps,
                         False,
                     )
                 if expert_in is None:
-                    expert_in = _decode_rmsnorm(
+                    expert_in = self._gemma4_flat_rmsnorm(
                         residual,
                         lw.pre_expert_norm_weight,
                         norm_eps,
@@ -17072,14 +17179,14 @@ class MegaGemmLlama(nn.Module):
                     )
                     self._gemma4_flat_fused_post_moe_norm_residual_hits += 1
                 else:
-                    expert_normed = _decode_rmsnorm(
+                    expert_normed = self._gemma4_flat_rmsnorm(
                         expert_out,
                         lw.post_expert_norm_weight,
                         norm_eps,
                         False,
                     )
                     shared_normed.add_(expert_normed)
-                    down_normed = _decode_rmsnorm(
+                    down_normed = self._gemma4_flat_rmsnorm(
                         shared_normed,
                         lw.post_ff_norm_weight,
                         norm_eps,
@@ -17088,17 +17195,25 @@ class MegaGemmLlama(nn.Module):
                 _timing_record_end(timing_events, "mlp_output_norm", mlp_output_norm_start_end)
             else:
                 mlp_output_norm_start_end = _timing_record_start(timing_events is not None)
-                down_normed = _decode_rmsnorm(
-                    down_out,
-                    lw.post_ff_norm_weight,
-                    norm_eps,
-                    norm_offset,
+                has_ple_tail = bool(
+                    lw.ple_size > 0 and per_layer_inputs is not None
                 )
+                if dense_post_norm_chain and not has_ple_tail:
+                    down_normed = None
+                else:
+                    down_normed = self._gemma4_flat_rmsnorm(
+                        down_out,
+                        lw.post_ff_norm_weight,
+                        norm_eps,
+                        norm_offset,
+                    )
                 _timing_record_end(timing_events, "mlp_output_norm", mlp_output_norm_start_end)
-            if not post_moe_chain_fused:
+            if not post_moe_chain_fused and down_normed is not None:
                 hidden = residual.add_(down_normed)
 
-            if lw.ple_size > 0 and per_layer_inputs is not None:
+            has_ple_tail = bool(lw.ple_size > 0 and per_layer_inputs is not None)
+            ple_proj = None
+            if has_ple_tail:
                 residual = hidden
                 ple_start_end = _timing_record_start(timing_events is not None)
                 ple = self._flat_fp_linear(
@@ -17115,16 +17230,50 @@ class MegaGemmLlama(nn.Module):
                     None,
                     self._gemma4_flat_ple_proj_bufs[layer_idx],
                 )
-                ple_normed = _decode_rmsnorm(
-                    ple_proj,
-                    lw.post_ple_norm_weight,
-                    norm_eps,
-                    False,
-                )
-                hidden = residual.add_(ple_normed)
+                if not dense_post_norm_chain:
+                    ple_normed = self._gemma4_flat_rmsnorm(
+                        ple_proj,
+                        lw.post_ple_norm_weight,
+                        norm_eps,
+                        False,
+                    )
+                    hidden = residual.add_(ple_normed)
                 _timing_record_end(timing_events, "ple", ple_start_end)
 
-            if not fuse_next_attn_norm:
+            if dense_post_norm_chain and not lw.is_moe:
+                write_next_dense_norm = layer_idx + 1 < len(
+                    self._flat_layer_weights
+                )
+                dense_branch = ple_proj if has_ple_tail else down_out
+                dense_weight = (
+                    lw.post_ple_norm_weight
+                    if has_ple_tail
+                    else lw.post_ff_norm_weight
+                )
+                hidden, _ = rmsnorm_triton_residual_scale_next(
+                    dense_branch,
+                    residual,
+                    dense_weight,
+                    lw.layer_scalar,
+                    (
+                        self._flat_layer_weights[layer_idx + 1].input_norm_weight
+                        if write_next_dense_norm
+                        else None
+                    ),
+                    norm_eps,
+                    norm_offset=False if has_ple_tail else norm_offset,
+                    next_norm_offset=norm_offset,
+                    out_hidden=residual,
+                    next_norm_out=(
+                        self._gemma4_flat_dense_next_attn_norm_bufs[layer_idx]
+                        if write_next_dense_norm
+                        else None
+                    ),
+                )
+                self._gemma4_flat_dense_post_norm_chain_hits += 1
+                if write_next_dense_norm:
+                    self._gemma4_flat_dense_next_attn_norm_hits += 1
+            elif not fuse_next_attn_norm:
                 hidden.mul_(lw.layer_scalar.to(device=hidden.device, dtype=hidden.dtype))
 
         return hidden.unsqueeze(1)

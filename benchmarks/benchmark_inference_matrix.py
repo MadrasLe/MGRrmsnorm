@@ -702,6 +702,7 @@ def write_outputs(args: argparse.Namespace, rows: list[dict[str, Any]]) -> tuple
                     "MEGAGEMM_GEMMA4_FUSED_QKV_DECODE",
                     "MEGAGEMM_GEMMA4_FUSED_GATEUP_DECODE",
                     "MEGAGEMM_GEMMA4_DEEPFUSION_MLP_DECODE",
+                    "MEGAGEMM_GEMMA4_DENSE_POST_NORM_CHAIN_DECODE",
                     "MEGAGEMM_SKIP_CUDA",
                     "MICROGEMM_CACHE_DIR",
                     "OMP_NUM_THREADS",
