@@ -22,20 +22,16 @@ Examples:
 from __future__ import annotations
 
 import argparse
-import ctypes
 import csv
 import gc
-import glob
 import importlib.metadata
 import json
 import os
 import platform
 import shutil
-import site
 import statistics
 import subprocess
 import sys
-import sysconfig
 import tempfile
 import time
 import traceback
@@ -1877,83 +1873,6 @@ def vllm_dtype(name: str) -> str:
     return name
 
 
-def _python_lib_roots() -> list[Path]:
-    roots: list[Path] = []
-
-    def add(raw: str | None) -> None:
-        if not raw:
-            return
-        path = Path(raw)
-        if path.exists() and path not in roots:
-            roots.append(path)
-
-    try:
-        for raw in site.getsitepackages():
-            add(raw)
-    except Exception:
-        pass
-    try:
-        add(site.getusersitepackages())
-    except Exception:
-        pass
-    for key in ("purelib", "platlib"):
-        try:
-            add(sysconfig.get_paths().get(key))
-        except Exception:
-            pass
-    return roots
-
-
-def _preload_vllm_cuda13_runtime() -> tuple[str | None, str]:
-    if sys.platform == "win32":
-        return None, "skipped on Windows"
-
-    explicit = os.environ.get("VLLM_CUDA_RUNTIME_LIB")
-    candidates: list[str] = []
-    if explicit:
-        candidates.append(explicit)
-
-    patterns = (
-        "nvidia/cuda_runtime/lib/libcudart.so.13*",
-        "nvidia/cuda_runtime/lib64/libcudart.so.13*",
-        # New CUDA 13 runtime wheels use layouts such as
-        # site-packages/nvidia/cu13/lib/libcudart.so.13.
-        "nvidia/**/libcudart.so.13*",
-        "nvidia/**/lib/libcudart.so.13*",
-        "nvidia/**/lib64/libcudart.so.13*",
-        "nvidia/cuda_runtime/lib/libcudart.so*",
-        "nvidia/cuda_runtime/lib64/libcudart.so*",
-        "nvidia/**/libcudart.so*",
-        "nvidia/**/lib/libcudart.so*",
-        "nvidia/**/lib64/libcudart.so*",
-    )
-    for root in _python_lib_roots():
-        for pattern in patterns:
-            candidates.extend(glob.glob(str(root / pattern)))
-
-    seen: set[str] = set()
-    unique_candidates: list[str] = []
-    for candidate in candidates:
-        if candidate not in seen and Path(candidate).exists():
-            seen.add(candidate)
-            unique_candidates.append(candidate)
-
-    unique_candidates.sort(key=lambda item: (not item.endswith(".so.13"), item))
-    if not unique_candidates:
-        return None, "no libcudart.so.13 candidate found under Python site-packages"
-
-    errors: list[str] = []
-    mode = getattr(ctypes, "RTLD_GLOBAL", 0)
-    for candidate in unique_candidates:
-        try:
-            ctypes.CDLL(candidate, mode=mode)
-            return candidate, "preloaded"
-        except OSError as exc:
-            errors.append(f"{candidate}: {exc}")
-
-    return None, "; ".join(errors[-3:])
-
-
 def load_vllm_runner(args: argparse.Namespace, tokenizer):
     if args.device != "cuda":
         raise ValueError("vLLM backend in this benchmark expects --device cuda")
@@ -1962,20 +1881,14 @@ def load_vllm_runner(args: argparse.Namespace, tokenizer):
     if args.vllm_disable_cudagraph_memory_profiler:
         os.environ.setdefault("VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS", "0")
 
-    cuda13_runtime, cuda13_runtime_status = _preload_vllm_cuda13_runtime()
     try:
         from vllm import LLM, SamplingParams
     except Exception as exc:
-        preload_note = (
-            f" vLLM CUDA 13 runtime preload: {cuda13_runtime}."
-            if cuda13_runtime
-            else f" vLLM CUDA 13 runtime preload failed/skipped: {cuda13_runtime_status}."
-        )
         raise RuntimeError(
             "vLLM is not installed or failed to import. "
             f"Underlying import error: {type(exc).__name__}: {exc}. "
-            f"{preload_note} "
-            "Install it in the benchmark environment, for example: pip install -U vllm"
+            "Install a vLLM wheel whose CUDA/PyTorch ABI matches the isolated "
+            "benchmark environment."
         ) from exc
 
     llm_kwargs: dict[str, Any] = {
