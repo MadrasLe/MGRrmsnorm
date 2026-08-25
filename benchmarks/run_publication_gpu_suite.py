@@ -13,6 +13,7 @@ import json
 import os
 import shlex
 import shutil
+import site
 import statistics
 import subprocess
 import sys
@@ -168,6 +169,40 @@ def profile_environment(profile: str, model: str) -> dict[str, str]:
     return dict(MEGAGEMM_PROFILES[profile])
 
 
+def find_vllm_cuda13_runtime() -> Path | None:
+    """Locate the CUDA 13 runtime required by vLLM's stable extension."""
+    explicit = os.environ.get("VLLM_CUDA_RUNTIME_LIB")
+    if explicit:
+        path = Path(explicit)
+        if path.is_file():
+            return path
+
+    roots: list[Path] = []
+    try:
+        roots.extend(Path(raw) for raw in site.getsitepackages())
+    except Exception:
+        pass
+    try:
+        roots.append(Path(site.getusersitepackages()))
+    except Exception:
+        pass
+
+    matches: list[Path] = []
+    for root in roots:
+        if root.exists():
+            matches.extend(root.glob("nvidia/**/libcudart.so.13*"))
+    files = sorted({path.resolve() for path in matches if path.is_file()})
+    return files[0] if files else None
+
+
+def _prepend_env_path(env: dict[str, str], key: str, value: str) -> None:
+    existing = env.get(key, "")
+    parts = [part for part in existing.split(os.pathsep) if part]
+    if value in parts:
+        parts.remove(value)
+    env[key] = os.pathsep.join([value, *parts])
+
+
 def child_environment(
     variant: Variant,
     profile: str,
@@ -180,6 +215,17 @@ def child_environment(
             # validation harness and are not part of the dense L4 speed path.
             env.pop("CUBLAS_WORKSPACE_CONFIG", None)
         env.update(profile_environment(profile, model))
+    elif variant.backend == "vllm":
+        # vLLM 0.26 inspects model classes in a fresh Python subprocess. A
+        # ctypes preload in benchmark_inference_matrix.py affects only its
+        # current process, so inject libcudart before the child and every vLLM
+        # descendant start. LD_LIBRARY_PATH alone is insufficient on Colab.
+        cuda13_runtime = find_vllm_cuda13_runtime()
+        if cuda13_runtime is not None:
+            _prepend_env_path(env, "LD_PRELOAD", str(cuda13_runtime))
+            _prepend_env_path(env, "LD_LIBRARY_PATH", str(cuda13_runtime.parent))
+        # This is a MegaGemm benchmark hint, not a recognized vLLM variable.
+        env.pop("VLLM_CUDA_RUNTIME_LIB", None)
     return env
 
 
