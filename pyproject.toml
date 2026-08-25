@@ -59,6 +59,9 @@ embeddings = [
     "transformers",
     "sentencepiece",
 ]
+config = [
+    "PyYAML>=6.0",
+]
 cpu = [
     "numpy",
 ]
@@ -87,6 +90,7 @@ all = [
     "safetensors",
     "transformers",
     "sentencepiece",
+    "PyYAML>=6.0",
     "numpy",
     "psutil",
     "tqdm",

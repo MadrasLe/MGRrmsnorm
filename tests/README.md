@@ -7,9 +7,9 @@ harnesses.
 
 Current source inventory:
 
-- 46 Python test files;
-- approximately 18.5k lines of test code;
-- 512 functions named `test_*`;
+- 48 Python test files;
+- approximately 18.9k lines of test code;
+- 527 functions named `test_*`;
 - CPU-safe unit tests, GPU kernel tests, model integration tests, and remote
   hardware harnesses.
 
@@ -19,7 +19,7 @@ Counts are descriptive and will change as the project evolves.
 
 | Class | Examples | Expected environment |
 |---|---|---|
-| Pure Python/reporting | `test_xai.py`, `test_monitor.py` | Python + base package |
+| Pure Python/reporting | `test_xai.py`, `test_monitor.py`, `test_run_config.py` | Python + base package; YAML case skips without the optional parser |
 | CPU/PyTorch logic | `test_deterministic.py`, `test_scheduler.py`, `test_mgx.py` | CPU PyTorch; optional packages by module |
 | Kernel policy/heuristics | `test_rmsnorm_policy.py`, `test_paged_attention_heuristics.py` | Usually CPU with mocked device properties; pytest for monkeypatch fixtures |
 | CUDA/Triton kernels | `test_rmsnorm.py`, `test_awq_gemm.py`, `test_qwen3_moe.py` | Compatible NVIDIA GPU and feature extras |
@@ -42,6 +42,7 @@ For pytest-style CPU tests:
 
 ```bash
 pytest -q \
+  tests/test_run_config.py \
   tests/test_scheduler.py \
   tests/test_paged_attention_heuristics.py \
   tests/test_rmsnorm_policy.py

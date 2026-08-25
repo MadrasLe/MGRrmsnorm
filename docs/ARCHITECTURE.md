@@ -339,6 +339,14 @@ checkpoint config + device capabilities + execution options
        fetch/materialize selected components and compile on demand
 ```
 
+The versioned `megagemm run` JSON/YAML interface is the first declarative front
+end to this design. Its current implementation performs strict schema and
+cross-field validation, selects the existing single or continuous-batch public
+API, and constructs the engine from stable options. Its `--dry-run` output is a
+normalized configuration view; it does not yet claim that the complete
+model-specific kernel, state, memory, and dependency `RuntimePlan` shown above is
+implemented.
+
 For example, a text-only Gemma 4 E2B plan should select the Gemma 4 text
 backbone, its heterogeneous attention/PLE state rules, the scheduler, sampler,
 layer-aware cache, and the kernel families chosen for the detected GPU. It should

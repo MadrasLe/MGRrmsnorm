@@ -244,6 +244,32 @@ engine = InferenceEngine("meta-llama/Llama-3.2-3B-Instruct")
 print(engine.generate("Explain quantum computing in 3 sentences", max_new_tokens=200))
 ```
 
+### Declarative YAML/JSON inference
+
+MegaGemm also provides a strictly validated declarative runner. YAML support is
+an optional integration, so the base package still declares only `torch`:
+
+```bash
+pip install -e ".[inference,config]" --no-build-isolation
+megagemm run examples/inference.yaml
+```
+
+[`examples/inference.yaml`](examples/inference.yaml) defines the model, stable
+engine options, sampling policy, one prompt or a prompt batch, and text/JSON/JSONL
+output. `prompts` and `prompts_file` select the continuous-batching
+`generate_batch()` path; `prompt` selects `generate()` and can enable XAI or Logit
+Lens. Relative prompt/output paths are resolved from the configuration file.
+
+Validate and inspect normalized settings without loading model weights:
+
+```bash
+megagemm run examples/inference.yaml --dry-run
+```
+
+JSON configurations use the same schema without adding a parser dependency. See
+the complete field and validation reference in
+[`docs/ENGINE.md`](docs/ENGINE.md#declarative-inference-runner).
+
 ### INT8 (faster + 2x smaller)
 
 ```python

@@ -179,6 +179,72 @@ batch = engine.generate_batch(
 )
 ```
 
+### Declarative inference runner
+
+`megagemm run` maps a versioned JSON or YAML document to the same public
+`InferenceEngine`, `generate()`, and `generate_batch()` APIs. It is an interface
+over the owned MegaGemm runtime, not a subprocess wrapper or a translation to a
+comparison backend.
+
+```yaml
+version: 1
+task: generate
+model: Qwen/Qwen2.5-3B-Instruct
+
+engine:
+  device: cuda
+  dtype: bf16
+  max_seq_len: 4096
+  max_batch_size: 8
+  kv_alloc: auto
+  deterministic: true
+  seed: 42
+
+generation:
+  max_new_tokens: 128
+  temperature: 0.0
+  top_k: 50
+  top_p: 0.9
+
+prompts:
+  - Explain paged attention.
+  - Explain chunked prefill.
+
+output:
+  format: jsonl
+  path: outputs/results.jsonl
+  include_prompt: true
+```
+
+```bash
+megagemm run inference.yaml
+megagemm run inference.yaml --dry-run
+megagemm run inference.yaml --format json --output -
+```
+
+Version 1 accepts exactly one input source:
+
+| Field | Execution path |
+|---|---|
+| `prompt` | Single-request `generate()` |
+| `prompts` | Inline continuous batch through `generate_batch()` |
+| `prompts_file` | Non-empty lines loaded as a continuous batch; paths are relative to the config file |
+
+The `engine` mapping covers the stable constructor surface: device/dtype, KV
+allocation, sequence and batch limits, CPU/layer offload, quantization,
+monitor/dashboard, deterministic execution, and MGX payload controls. The
+`generation` mapping covers token count, temperature, top-k/top-p, stop tokens,
+verbosity, and single-request XAI/Logit Lens. Batch generation supports
+`ignore_eos`; its current API does not support repetition penalty or XAI, and the
+validator rejects configurations that would imply otherwise.
+
+Unknown keys, wrong scalar types, unsupported enum values, multiple input
+sources, and invalid cross-field combinations fail before the model is loaded.
+YAML is parsed only through `yaml.safe_load`. JSON uses the standard library;
+YAML requires the optional `.[config]` extra. `--dry-run` validates and prints
+normalized settings and prompt count, but does not claim to resolve the future
+model-specific kernel/memory `RuntimePlan`.
+
 Monitoring records request latency, token throughput, memory, and percentile
 summaries. XAI is opt-in and adds token probability, entropy/confidence, and
 optional layer-probe collection; its uncertainty field is not a factuality

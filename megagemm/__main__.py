@@ -19,6 +19,8 @@ import json
 import os
 import sys
 import time
+from pathlib import Path
+
 import torch
 
 
@@ -30,6 +32,27 @@ def _set_env_default_int(name: str, value: int) -> None:
 def _set_env_default_csv(name: str, values: list[str]) -> None:
     if name not in os.environ:
         os.environ[name] = ",".join(values)
+
+
+def _create_cli_inference_engine(args, *, default_max_batch_size: int = 1):
+    """Build an engine through the same typed configuration used by `run`."""
+    from megagemm.run_config import EngineRunConfig, create_inference_engine
+
+    config = EngineRunConfig(
+        device=args.device,
+        dtype="bf16" if args.bf16 else "fp16",
+        max_batch_size=getattr(args, "max_batch_size", default_max_batch_size),
+        quantize=args.quantize,
+        max_seq_len=args.max_seq_len,
+        monitor=getattr(args, "monitor", False),
+        dashboard=getattr(args, "dashboard", False),
+        deterministic=args.deterministic,
+        seed=args.seed,
+        mgx_verify_payload=False if args.mgx_skip_hash_check else None,
+        mgx_prefer_payload_cache=args.mgx_prefer_payload_cache,
+        mgx_payload_cache_dir=args.mgx_payload_cache_dir,
+    )
+    return create_inference_engine(args.model, config)
 
 
 def cmd_export_mgx(args):
@@ -62,25 +85,48 @@ def cmd_inspect_mgx(args):
     print(json.dumps(result, indent=2, ensure_ascii=False))
 
 
+def cmd_run(args):
+    """Run inference from a validated JSON or YAML configuration."""
+    from megagemm.run_config import (
+        RunConfigError,
+        execute_run_config,
+        load_run_config,
+        normalized_config_dict,
+        validate_run_config,
+    )
+
+    try:
+        config = load_run_config(args.config)
+        prompts = validate_run_config(config)
+        if args.dry_run:
+            payload = normalized_config_dict(config, prompt_count=len(prompts))
+            if args.output_format is not None:
+                payload["output"]["format"] = args.output_format
+            if args.output is not None:
+                payload["output"]["path"] = (
+                    None if args.output == "-" else str(Path(args.output).expanduser().resolve())
+                )
+            payload["dry_run"] = True
+            payload["note"] = (
+                "configuration validated; model-specific kernels and memory are not resolved"
+            )
+            print(json.dumps(payload, indent=2, ensure_ascii=False))
+            return
+
+        result = execute_run_config(
+            config,
+            output_format=args.output_format,
+            output_path=args.output,
+        )
+        if result.output_path is not None:
+            print(f"[MegaGemm] Wrote {result.output_path}")
+    except RunConfigError as exc:
+        raise SystemExit(f"megagemm run: {exc}") from exc
+
+
 def cmd_generate(args):
     """Generate text from a prompt."""
-    from megagemm.engine import InferenceEngine
-
-    engine = InferenceEngine(
-        args.model,
-        dtype=torch.bfloat16 if args.bf16 else torch.float16,
-        device=args.device,
-        quantize=args.quantize,
-        max_batch_size=args.max_batch_size,
-        max_seq_len=args.max_seq_len,
-        deterministic=args.deterministic,
-        seed=args.seed,
-        monitor=args.monitor,
-        dashboard=args.dashboard,
-        mgx_verify_payload=None if not args.mgx_skip_hash_check else False,
-        mgx_prefer_payload_cache=args.mgx_prefer_payload_cache,
-        mgx_payload_cache_dir=args.mgx_payload_cache_dir,
-    )
+    engine = _create_cli_inference_engine(args)
 
     result = engine.generate(
         args.prompt,
@@ -105,22 +151,8 @@ def cmd_generate(args):
 
 def cmd_chat(args):
     """Interactive chat mode."""
-    from megagemm.engine import InferenceEngine
-
     print(f"🔥 MegaGemm Chat — Loading {args.model}...")
-    engine = InferenceEngine(
-        args.model,
-        dtype=torch.bfloat16 if args.bf16 else torch.float16,
-        device=args.device,
-        quantize=args.quantize,
-        max_batch_size=args.max_batch_size,
-        max_seq_len=args.max_seq_len,
-        deterministic=args.deterministic,
-        seed=args.seed,
-        mgx_verify_payload=None if not args.mgx_skip_hash_check else False,
-        mgx_prefer_payload_cache=args.mgx_prefer_payload_cache,
-        mgx_payload_cache_dir=args.mgx_payload_cache_dir,
-    )
+    engine = _create_cli_inference_engine(args)
 
     print(f"\n💬 Chat ready! Type 'quit' or Ctrl+C to exit.\n")
 
@@ -153,23 +185,12 @@ def cmd_chat(args):
 
 def cmd_bench(args):
     """Benchmark decode speed."""
-    from megagemm.engine import InferenceEngine
-
     print(f"⚡ MegaGemm Benchmark — {args.model}")
     print(f"   Tokens: {args.max_tokens}, Runs: {args.runs}")
     print(f"   Quantize: {args.quantize or 'none'}, Device: {args.device}")
     print()
 
-    engine = InferenceEngine(
-        args.model,
-        dtype=torch.bfloat16 if args.bf16 else torch.float16,
-        device=args.device,
-        quantize=args.quantize,
-        max_seq_len=args.max_seq_len,
-        mgx_verify_payload=None if not args.mgx_skip_hash_check else False,
-        mgx_prefer_payload_cache=args.mgx_prefer_payload_cache,
-        mgx_payload_cache_dir=args.mgx_payload_cache_dir,
-    )
+    engine = _create_cli_inference_engine(args, default_max_batch_size=512)
 
     prompt = args.prompt or "Explain the theory of general relativity in detail."
     speeds = []
@@ -784,6 +805,29 @@ def main():
     p_gen.add_argument('--monitor', action='store_true', help='Enable inference monitoring')
     p_gen.add_argument('--dashboard', action='store_true', help='Start live monitoring dashboard')
     p_gen.set_defaults(func=cmd_generate)
+
+    # === declarative run ===
+    p_run = subparsers.add_parser(
+        'run',
+        help='Run inference from a validated JSON or YAML configuration',
+    )
+    p_run.add_argument('config', help='Path to a .json, .yaml, or .yml inference configuration')
+    p_run.add_argument(
+        '--format',
+        dest='output_format',
+        choices=['text', 'json', 'jsonl'],
+        help='Override output.format from the configuration',
+    )
+    p_run.add_argument(
+        '--output', '-o',
+        help="Override output.path; use '-' for stdout",
+    )
+    p_run.add_argument(
+        '--dry-run',
+        action='store_true',
+        help='Validate and print normalized settings without loading the model',
+    )
+    p_run.set_defaults(func=cmd_run)
 
     # === chat ===
     p_chat = subparsers.add_parser('chat', aliases=['c'], help='Interactive chat mode')

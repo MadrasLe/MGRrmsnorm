@@ -1,0 +1,29 @@
+version: 1
+task: generate
+
+model: Qwen/Qwen2.5-3B-Instruct
+
+engine:
+  device: cuda
+  dtype: bf16
+  max_seq_len: 4096
+  max_batch_size: 8
+  kv_alloc: auto
+  deterministic: true
+  seed: 42
+
+generation:
+  max_new_tokens: 128
+  temperature: 0.0
+  top_k: 50
+  top_p: 0.9
+  ignore_eos: false
+
+prompts:
+  - Explain paged attention in three paragraphs.
+  - Compare Hillis-Steele and Blelloch parallel scans.
+
+output:
+  format: jsonl
+  path: outputs/inference.jsonl
+  include_prompt: true

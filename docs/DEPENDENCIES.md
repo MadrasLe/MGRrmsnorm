@@ -18,11 +18,12 @@ capability-directed objective described in
 |---|---:|---|
 | Base package | 1 | `torch` |
 | Typical GPU inference (`.[inference]`) | 6 total | Base + Triton, Hugging Face Hub, Safetensors, Transformers, SentencePiece |
+| Declarative YAML (`.[config]`) | 2 total | Base + PyYAML; JSON configurations remain base-only |
 | CPU helpers (`.[cpu]`) | 2 total | Base + NumPy |
-| Stable full development profile (`.[all]`) | 12 total | Inference, CPU, monitoring, benchmark helpers, AWQ, and test tools |
-| Every declared path including hardware-specific accelerators | 14 total | Stable full profile + `causal-conv1d` and `flash-attn` |
+| Stable full development profile (`.[all]`) | 13 total | Inference, declarative YAML, CPU, monitoring, benchmark helpers, AWQ, and test tools |
+| Every declared path including hardware-specific accelerators | 15 total | Stable full profile + `causal-conv1d` and `flash-attn` |
 
-The project currently declares these 14 unique direct package names across all
+The project currently declares these 15 unique direct package names across all
 profiles:
 
 ```text
@@ -32,6 +33,7 @@ huggingface_hub
 safetensors
 transformers
 sentencepiece
+PyYAML
 numpy
 psutil
 tqdm
@@ -52,6 +54,7 @@ direct count is not the complete environment size.
 |---|---|
 | `inference` | GPU inference from Hugging Face checkpoints |
 | `embeddings` | Encoder and Sentence Transformers-compatible embeddings |
+| `config` | Optional YAML parser for `megagemm run`; JSON configuration needs no extra parser |
 | `cpu` | NumPy-backed CPU and tensor-codec helpers |
 | `mesh` | MegaMesh model loading and binary tensor transport |
 | `monitoring` | Host-memory telemetry through `psutil` |
@@ -73,6 +76,13 @@ Normal GPU inference development:
 
 ```bash
 pip install -e ".[inference,dev]" --no-build-isolation
+```
+
+GPU inference with the declarative YAML runner:
+
+```bash
+pip install -e ".[inference,config]" --no-build-isolation
+megagemm run examples/inference.yaml --dry-run
 ```
 
 CPU-oriented work:
