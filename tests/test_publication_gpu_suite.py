@@ -243,3 +243,96 @@ def test_e2b_audit_rejects_structurally_valid_but_regressed_l4_path(tmp_path):
     assert report["status"] == "failed"
     assert report["performance_gate"]["applicable"] is True
     assert any("regression gate failed" in error for error in report["errors"])
+
+
+def test_e2b_audit_accepts_disabled_graph_stats_being_omitted(tmp_path):
+    runner = load_runner()
+    raw_path = tmp_path / "e2b.jsonl"
+    row = {
+        "ok": True,
+        "model": "google/gemma-4-E2B-it",
+        "hardware_label": "1xl4",
+        "dtype": "bf16",
+        "scenario": "single",
+        "batch_size": 1,
+        "prompt_tokens_requested_per_request": 128,
+        "output_tps": 30.01,
+        "model_topology": {
+            "num_hidden_layers": 35,
+            "hidden_size": 1536,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 1,
+            "num_kv_shared_layers": 20,
+            "kv_cache_layers": 15,
+            "sliding_attention_layers": 28,
+            "full_attention_layers": 7,
+        },
+        "decode_runtime_stats": {
+            "flat_decode_ready": True,
+            "flat_decode_failed": False,
+        },
+        "scheduler_stats": {
+            "decode_execution": {
+                "prefer_step": False,
+                "decode_step_batches": 0,
+                "multi_step_batches": 128,
+            },
+        },
+    }
+    raw_path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+    report = runner.audit_gemma4_dense_fast_path(
+        raw_path, "gemma4-e2b-fast"
+    )
+
+    assert report["status"] == "passed"
+    assert report["required"]["decode_cuda_graphs_disabled"] is True
+    assert report["required"]["request_scheduler_reuse_count"] == 0
+
+
+def test_resume_rejects_a_summary_from_a_different_workload(tmp_path):
+    runner = load_runner()
+    summary_path = tmp_path / "summary.json"
+    summary_path.write_text(
+        json.dumps(
+            {
+                "args": {
+                    "backend": "megagemm",
+                    "model": "google/gemma-4-E2B-it",
+                    "hardware_label": "1xl4",
+                    "batch_sizes": "1,8",
+                    "prompt_tokens": "128,512,2048",
+                    "max_new_tokens": 64,
+                    "repeats": 5,
+                    "warmup": 3,
+                    "dtype": "bf16",
+                    "quantize": None,
+                    "max_seq_len": 2304,
+                    "max_batch_size": 8,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    args = runner.argparse.Namespace(
+        model="google/gemma-4-E2B-it",
+        batch_sizes="1,8",
+        prompt_tokens="128,512,2048",
+        max_new_tokens=128,
+        repeats=5,
+        max_batch_size=8,
+    )
+
+    try:
+        runner.validate_existing_variant_artifacts(
+            summary_path,
+            args=args,
+            variant=runner.VARIANTS["megagemm-bf16"],
+            hardware_label="1xl4",
+            warmup=3,
+            max_seq_len=2304,
+        )
+    except RuntimeError as exc:
+        assert "max_new_tokens" in str(exc)
+    else:
+        raise AssertionError("stale benchmark summary was reused")

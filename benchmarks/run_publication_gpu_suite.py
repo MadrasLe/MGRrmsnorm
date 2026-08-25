@@ -319,6 +319,44 @@ def raw_path(
     return run_dir / f"{run_id}_{variant.name}_{hardware_label}_{variant.backend}.jsonl"
 
 
+def validate_existing_variant_artifacts(
+    path: Path,
+    *,
+    args: argparse.Namespace,
+    variant: Variant,
+    hardware_label: str,
+    warmup: int,
+    max_seq_len: int,
+) -> None:
+    """Reject stale artifacts before a resumed publication run reuses them."""
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    recorded = payload.get("args") or {}
+    expected = {
+        "backend": variant.backend,
+        "model": args.model,
+        "hardware_label": hardware_label,
+        "batch_sizes": args.batch_sizes,
+        "prompt_tokens": args.prompt_tokens,
+        "max_new_tokens": args.max_new_tokens,
+        "repeats": args.repeats,
+        "warmup": warmup,
+        "dtype": variant.dtype,
+        "quantize": variant.quantize,
+        "max_seq_len": max_seq_len,
+        "max_batch_size": args.max_batch_size,
+    }
+    mismatches = {
+        key: {"expected": value, "recorded": recorded.get(key)}
+        for key, value in expected.items()
+        if recorded.get(key) != value
+    }
+    if mismatches:
+        raise RuntimeError(
+            f"cannot resume {variant.name}: existing summary does not match "
+            f"this workload: {mismatches}"
+        )
+
+
 def _max_counter(stats: list[dict], key: str) -> int:
     return max((int(item.get(key, 0) or 0) for item in stats), default=0)
 
@@ -424,7 +462,10 @@ def audit_gemma4_dense_fast_path(path: Path, profile: str) -> dict:
         errors.append(f"flat decode not ready: {', '.join(reasons)}")
     if decode_stats and any(item.get("flat_decode_failed") for item in decode_stats):
         errors.append("flat decode reported a runtime failure")
-    if len(graph_stats) != len(successful):
+    # E2B disables both graphs and scheduler reuse, so Scheduler historically
+    # omitted this all-zero diagnostics block.  E4B enables reuse and must emit
+    # it.  Newer schedulers emit the block unconditionally for explicit proof.
+    if expected_reuse and len(graph_stats) != len(successful):
         errors.append("decode_cuda_graphs stats missing from one or more rows")
     if graph_stats and any(item.get("enabled") for item in graph_stats):
         errors.append("decode CUDA Graphs were unexpectedly enabled")
@@ -530,7 +571,8 @@ def audit_gemma4_dense_fast_path(path: Path, profile: str) -> dict:
             "decode_step_batches": decode_step_batches,
             "multi_step_batches": multi_step_batches,
             "decode_cuda_graphs_disabled": bool(
-                graph_stats and not any(item.get("enabled") for item in graph_stats)
+                not graph_stats
+                or not any(item.get("enabled") for item in graph_stats)
             ),
             "decode_cuda_graph_captures": graph_captures,
             "decode_cuda_graph_replays": graph_replays,
@@ -650,6 +692,14 @@ def main() -> int:
     parser.add_argument("--vllm-enforce-eager", action="store_true")
     parser.add_argument("--out-dir", default="bench_results/publication_gpu")
     parser.add_argument("--run-id", default="")
+    parser.add_argument(
+        "--resume-existing",
+        action="store_true",
+        help=(
+            "Reuse matching raw/summary artifacts in the run directory, "
+            "audit them again, and execute only missing variants."
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -726,19 +776,41 @@ def main() -> int:
 
     for variant, command in zip(variants, commands):
         print(f"\n=== {variant.name} ===", flush=True)
-        subprocess.run(
-            command,
-            cwd=ROOT,
-            check=True,
-            env=child_environment(variant, megagemm_profile, args.model),
+        variant_raw_path = raw_path(
+            run_dir, run_id, hardware_label, variant
         )
+        variant_summary_path = summary_path(
+            run_dir, run_id, hardware_label, variant
+        )
+        reuse_existing = bool(
+            args.resume_existing
+            and variant_raw_path.exists()
+            and variant_summary_path.exists()
+        )
+        if reuse_existing:
+            validate_existing_variant_artifacts(
+                variant_summary_path,
+                args=args,
+                variant=variant,
+                hardware_label=hardware_label,
+                warmup=effective_warmup,
+                max_seq_len=effective_max_seq_len,
+            )
+            print(
+                f"  resume: reusing matching artifacts for {variant.name}",
+                flush=True,
+            )
+        else:
+            subprocess.run(
+                command,
+                cwd=ROOT,
+                check=True,
+                env=child_environment(variant, megagemm_profile, args.model),
+            )
         if (
             variant.backend == "megagemm"
             and megagemm_profile in GEMMA4_PROFILE_REQUIREMENTS
         ):
-            variant_raw_path = raw_path(
-                run_dir, run_id, hardware_label, variant
-            )
             audit = audit_gemma4_dense_fast_path(
                 variant_raw_path, megagemm_profile
             )

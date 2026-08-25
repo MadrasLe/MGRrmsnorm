@@ -2893,4 +2893,21 @@ class Scheduler:
                 stats['decode_cuda_graphs']['last_failure'] = (
                     self._decode_graph_last_failure
                 )
+        if 'decode_cuda_graphs' not in stats:
+            # Keep disabled eager runs auditable.  Previously this all-zero
+            # block was omitted, which made "disabled" indistinguishable from
+            # missing instrumentation in publication artifacts.
+            stats['decode_cuda_graphs'] = {
+                'enabled': False,
+                'prefer_step': bool(self._decode_cuda_graph_prefer_step),
+                'request_scheduler_reuse_enabled': bool(
+                    self._request_scheduler_reuse_enabled
+                ),
+                'request_scheduler_reused': False,
+                'request_scheduler_reuse_count': 0,
+                'captures': 0,
+                'replays': 0,
+                'warmups': 0,
+                'failures': 0,
+            }
         return stats
