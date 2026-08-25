@@ -5,6 +5,13 @@ behind optional extras. Dependency counts below refer to **direct declarations**
 in `pyproject.toml`; packages such as PyTorch and Transformers have their own
 transitive dependency trees.
 
+This is an architectural boundary, not only a packaging convenience. A selected
+runtime path should require its own integrations without pulling distributed,
+monitoring, embedding, quantization, benchmark, or hardware-specific stacks that
+it does not use. Internal model and kernel selection follows the same
+capability-directed objective described in
+[`ARCHITECTURE.md`](ARCHITECTURE.md#architectural-objective-capability-directed-runtime).
+
 ## Direct dependency count
 
 | Installation profile | Direct external dependencies | Purpose |

@@ -28,6 +28,37 @@ See [Performance](#-performance) for the complete breakdown and limitations.
 [Dependencies](docs/DEPENDENCIES.md) · [Benchmark evidence](docs/BENCHMARKS.md) ·
 [Test suite](tests/README.md) · [Contributing](CONTRIBUTING.md)
 
+## 🧭 Architectural Goals
+
+MegaGemm is designed as an owned inference runtime, not as a wrapper around another
+engine. Its dependency and execution model follows these goals:
+
+- **Small mandatory surface:** the base package declares only `torch`; checkpoint
+  loading, embeddings, mesh, monitoring, benchmarks, quantization integrations,
+  and hardware-specific accelerators remain optional.
+- **Capability-directed execution:** model architecture, hardware, dtype,
+  quantization, and workload should select the exact runtime services, cache
+  layout, and kernel families required by that execution.
+- **Pay only for selected paths:** an unused model family or subsystem should not
+  allocate weights or cache state, require its optional dependencies, or trigger
+  native/Triton compilation.
+- **Architecture-aware materialization:** models are created on the `meta` device,
+  selected weights are streamed into their destination, text-only loading can
+  exclude unused multimodal towers, and heterogeneous models can allocate KV
+  state only for the layers that need it.
+- **Portable model-specific artifacts:** MGX moves deployment toward transformed,
+  reproducible runtime artifacts that avoid repeating checkpoint parsing, fusion,
+  and on-load quantization work.
+- **Explicit fallbacks:** optional accelerators must fall back to a validated path
+  instead of making the base engine unloadable.
+
+The installation surface and top-level Python package are already modular. The
+full engine import graph, native build, checkpoint shard download, and MGX tokenizer
+packaging are not yet as capability-directed as the target design. These current
+boundaries are documented rather than presented as completed work. See
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#architectural-objective-capability-directed-runtime)
+and [`docs/DEPENDENCIES.md`](docs/DEPENDENCIES.md).
+
 ---
 
 ## 📊 Performance

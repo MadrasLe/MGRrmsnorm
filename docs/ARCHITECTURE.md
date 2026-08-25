@@ -276,6 +276,92 @@ against llama.cpp belong specifically to this backend unless a report states
 otherwise; the generic PyTorch CPU path in `InferenceEngine` has different
 performance characteristics.
 
+## Architectural objective: capability-directed runtime
+
+MegaGemm owns its model execution, scheduling, cache management, sampling, and
+kernel dispatch. It is not a compatibility layer over another inference engine.
+The corresponding architectural objective is to make the runtime
+**capability-directed**: the selected model, device, dtype, quantization mode, and
+workload determine which pieces are installed, imported, materialized, compiled,
+and executed.
+
+Modularity has several distinct surfaces. A small dependency list alone does not
+prove that a runtime is fully modular:
+
+1. **Installation surface:** which external distributions must exist before a
+   feature can run.
+2. **Import surface:** which Python modules and kernel definitions enter the
+   process for a selected engine path.
+3. **Materialization surface:** which weights, KV/recurrent state, buffers, and
+   services consume host or device memory.
+4. **Compilation surface:** which native extensions, Triton specializations, and
+   CUDA graphs are built or captured.
+5. **Artifact surface:** which checkpoint shards, tokenizer assets, and metadata
+   must be downloaded or shipped for deployment.
+
+### Current state and target boundary
+
+| Surface | Current implementation | Architectural target |
+|---|---|---|
+| Base installation | One mandatory direct dependency: `torch`; integrations live behind extras | Preserve the small base and keep unrelated serving, distributed, monitoring, and benchmark stacks optional |
+| Top-level import | `megagemm`, `megagemm.engine`, and `megagemm.embeddings` expose public objects through lazy `__getattr__` dispatch | Preserve lazy public imports |
+| Engine import | The unified model implementation feature-probes a broad set of architecture and kernel modules | Resolve an architecture manifest first, then import only its model path and required kernel families |
+| Kernel execution | Triton kernels compile on first selected use; importing their definitions does not compile every specialization | Produce an explicit kernel plan and compile/cache only plan entries |
+| Weight materialization | Config-specific models are constructed on `meta`; loading streams selected tensors to their destination | Preserve streaming materialization and make selection visible in the runtime plan |
+| Multimodal checkpoints | Text-only Gemma 4 loading filters non-text towers before materialization | Generalize component filtering to every multimodal architecture |
+| Runtime state | Layer-aware KV allocation avoids allocating paged KV for layers represented by recurrent or shared state | Derive every cache/state allocation from the architecture plan |
+| Checkpoint download | Hugging Face loading can still download all matching Safetensors files before unused components are filtered | Read the index first and fetch only shards containing selected components |
+| Native build | Available native helpers/extensions can be attempted as a group during package build | Select prebuilt or local extensions from device and capability requirements |
+| MGX deployment | MGX stores transformed runtime weights and optional session state; tokenizer sidecars may still come from the original checkpoint | Embed a runtime manifest and the complete tokenizer asset set for a self-contained model-specific deployment |
+
+The current split is therefore precise: **dependency installation, public imports,
+and runtime weight/state materialization already provide meaningful modularity**;
+the engine's internal import graph, checkpoint download selection, native build,
+and some artifact assets remain broader than the intended end state.
+
+### Runtime-plan model
+
+The intended selection flow is:
+
+```text
+checkpoint config + device capabilities + execution options
+                         │
+                         ▼
+                    RuntimePlan
+          ┌──────────────┼────────────────┐
+          ▼              ▼                ▼
+ architecture path   state/cache plan   kernel plan
+          │              │                │
+          └──────────────┼────────────────┘
+                         ▼
+        validate only required optional integrations
+                         ▼
+       fetch/materialize selected components and compile on demand
+```
+
+For example, a text-only Gemma 4 E2B plan should select the Gemma 4 text
+backbone, its heterogeneous attention/PLE state rules, the scheduler, sampler,
+layer-aware cache, and the kernel families chosen for the detected GPU. It should
+not require or initialize Qwen 3.5 linear-attention scans, Qwen MoE paths,
+embedding-engine code, MegaMesh, monitoring, XAI, or an unused multimodal tower.
+An E4B plan may select a different execution and memory policy even within the
+same architecture family; model scale is an input to planning, not merely a
+larger allocation passed through an identical fast path.
+
+### Packaging rule
+
+Capability-directed loading does not require fragmenting the project into many
+independently versioned Python distributions. The preferred boundary is one
+source package with a small mandatory core, feature extras for external
+integrations, lazy internal registries, and model-specific runtime plans. This
+keeps installation understandable without recreating cross-package dependency
+coordination inside MegaGemm.
+
+Comparison backends are deliberately outside this boundary. vLLM and llama.cpp
+belong to isolated benchmark environments and are not dependencies of the
+MegaGemm engine. Their installation state must not alter which MegaGemm code path
+or package profile is required for inference.
+
 ## Maturity labels
 
 Issues and documentation use these labels:
