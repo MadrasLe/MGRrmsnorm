@@ -1,3 +1,5 @@
+import contextlib
+
 import torch
 
 from megagemm.engine.scheduler import Request, RequestStatus, Scheduler
@@ -424,6 +426,275 @@ def test_scheduler_native_graph_burst_avoids_python_decode_loop(monkeypatch):
     assert stats["native_token_burst_enabled"] is True
     assert stats["native_token_bursts"] == 1
     assert stats["native_token_burst_steps"] == 3
+
+
+def test_scheduler_unrolled_graph_capture_chains_tokens_and_metadata(monkeypatch):
+    class _CaptureBlockManager(_FakeBlockManager):
+        def __init__(self):
+            super().__init__()
+            self.override = None
+
+        def set_decode_metadata_override(
+            self,
+            block_table,
+            seq_lens,
+            max_decode_blocks=None,
+        ):
+            self.override = {
+                "block_table": block_table,
+                "seq_lens": seq_lens,
+                "max_decode_blocks": max_decode_blocks,
+            }
+
+        def clear_decode_metadata_override(self):
+            self.override = None
+
+    class _CaptureModel:
+        def decode_step(
+            self,
+            input_ids,
+            positions,
+            block_manager,
+            seq_ids,
+            return_next_token=False,
+        ):
+            assert return_next_token is True
+            next_tokens = input_ids.reshape(len(seq_ids)) + 1
+            for seq_id in seq_ids:
+                block_manager.seq_lens[int(seq_id)] += 1
+            block_manager.override["seq_lens"].add_(1)
+            return next_tokens
+
+    class _FakeCudaGraph:
+        def __init__(self):
+            self.replays = 0
+
+        def replay(self):
+            self.replays += 1
+
+    monkeypatch.setattr(torch.cuda, "CUDAGraph", _FakeCudaGraph)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(
+        torch.cuda,
+        "graph",
+        lambda graph: contextlib.nullcontext(),
+    )
+
+    blocks = _CaptureBlockManager()
+    for seq_id, length in ((0, 3), (1, 2)):
+        blocks.allocate_sequence(seq_id, length)
+        blocks.seq_lens[seq_id] = length
+    scheduler = Scheduler(_CaptureModel(), blocks, max_batch_size=2, device="cpu")
+    state = {
+        "graph_input_ids": torch.tensor([[11], [21]], dtype=torch.long),
+        "graph_positions": torch.tensor([[3], [2]], dtype=torch.long),
+        "block_table": torch.tensor([[0], [1]], dtype=torch.int32),
+        "seq_lens": torch.tensor([3, 2], dtype=torch.int32),
+        "max_decode_blocks": 1,
+        "block_signature": ((0,), (1,)),
+        "unrolled_burst_graphs": {},
+    }
+    output = torch.empty(2, 3, dtype=torch.long)
+
+    entry = scheduler._capture_decode_unrolled_graph_burst(
+        state=state,
+        seq_ids=[0, 1],
+        output_tokens=output,
+        num_steps=3,
+    )
+
+    assert output.tolist() == [[12, 13, 14], [22, 23, 24]]
+    assert state["graph_input_ids"].tolist() == [[14], [24]]
+    assert state["graph_positions"].tolist() == [[6], [5]]
+    assert state["seq_lens"].tolist() == [6, 5]
+    assert blocks.seq_lens == {0: 6, 1: 5}
+    assert blocks.override is None
+    assert entry["num_steps"] == 3
+    assert entry["graph"].replays == 1
+    assert state["unrolled_burst_graphs"][3] is entry
+    assert scheduler._decode_unrolled_graph_burst_captures == 1
+    assert scheduler._decode_unrolled_graph_burst_replays == 1
+
+
+def test_scheduler_shape_graph_capture_replays_before_returning(monkeypatch):
+    class _CaptureBlockManager(_FakeBlockManager):
+        def __init__(self):
+            super().__init__()
+            self.override = None
+
+        def set_decode_metadata_override(
+            self,
+            block_table,
+            seq_lens,
+            max_decode_blocks=None,
+        ):
+            self.override = {
+                "block_table": block_table,
+                "seq_lens": seq_lens,
+                "max_decode_blocks": max_decode_blocks,
+            }
+
+        def clear_decode_metadata_override(self):
+            self.override = None
+
+    class _CaptureModel:
+        def decode_step(
+            self,
+            input_ids,
+            positions,
+            block_manager,
+            seq_ids,
+            return_next_token=False,
+        ):
+            assert return_next_token is True
+            for seq_id in seq_ids:
+                block_manager.seq_lens[int(seq_id)] += 1
+            block_manager.override["seq_lens"].add_(1)
+            return input_ids.reshape(len(seq_ids)) + 1
+
+    class _FakeCudaGraph:
+        def __init__(self):
+            self.replays = 0
+
+        def replay(self):
+            self.replays += 1
+
+    monkeypatch.setattr(torch.cuda, "CUDAGraph", _FakeCudaGraph)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(
+        torch.cuda,
+        "graph",
+        lambda graph: contextlib.nullcontext(),
+    )
+
+    blocks = _CaptureBlockManager()
+    for seq_id, length in ((0, 3), (1, 2)):
+        blocks.allocate_sequence(seq_id, length)
+        blocks.seq_lens[seq_id] = length
+    scheduler = Scheduler(_CaptureModel(), blocks, max_batch_size=2, device="cpu")
+    state = {
+        "block_table": torch.tensor([[0], [1]], dtype=torch.int32),
+        "seq_lens": torch.tensor([3, 2], dtype=torch.int32),
+        "max_decode_blocks": 1,
+    }
+    input_ids = torch.tensor([[11], [21]], dtype=torch.long)
+    positions = torch.tensor([[3], [2]], dtype=torch.long)
+
+    tokens = scheduler._capture_decode_graph_shape(
+        (2, 1, 1),
+        state,
+        [0, 1],
+        input_ids,
+        positions,
+        return_next_token=True,
+        chain_graph_inputs=True,
+    )
+
+    assert tokens.tolist() == [12, 22]
+    assert state["graph"].replays == 1
+    assert scheduler._decode_graph_capture_count == 1
+    assert scheduler._decode_graph_replay_count == 1
+    assert blocks.override is None
+
+
+def test_scheduler_unrolled_graph_burst_replays_once_for_all_steps(monkeypatch):
+    blocks = _FakeBlockManager()
+    scheduler = Scheduler(
+        _GreedyTokenBurstModel(), blocks, max_batch_size=2, device="cpu"
+    )
+    requests = []
+    for seq_id, prompt, first_token in (
+        (0, [1, 2, 3], 11),
+        (1, [4, 5], 21),
+    ):
+        blocks.allocate_sequence(seq_id, len(prompt))
+        blocks.seq_lens[seq_id] = len(prompt)
+        request = Request(
+            request_id=seq_id,
+            seq_id=seq_id,
+            prompt_ids=prompt,
+            generated_ids=[first_token],
+            status=RequestStatus.RUNNING,
+            max_new_tokens=5,
+            temperature=0.0,
+        )
+        scheduler._running[seq_id] = request
+        requests.append(request)
+
+    graph_output = torch.empty(2, 3, dtype=torch.long)
+
+    class _FakeUnrolledGraph:
+        def __init__(self):
+            self.replays = 0
+
+        def replay(self):
+            self.replays += 1
+            graph_output.copy_(torch.tensor([[12, 13, 14], [22, 23, 24]]))
+
+    graph = _FakeUnrolledGraph()
+    seq_ids = [0, 1]
+    scheduler._decode_cuda_graphs = True
+    scheduler._decode_cuda_graph_shape_cache = True
+    scheduler._decode_graph_persistent_token_feedback = True
+    scheduler._decode_unrolled_graph_burst = True
+    scheduler._batch_changed = False
+    key = scheduler._decode_graph_shape_key(
+        seq_ids,
+        return_next_token=True,
+        chain_graph_inputs=True,
+    )
+    scheduler._decode_graph_shape_states[key] = {
+        "graph": object(),
+        "logits": torch.tensor([11, 21]),
+        "seq_key": tuple(seq_ids),
+        "block_signature": tuple(
+            tuple(blocks.block_tables[seq_id]) for seq_id in seq_ids
+        ),
+        "return_next_token": True,
+        "unrolled_burst_graphs": {
+            3: {
+                "graph": graph,
+                "output_tokens": graph_output,
+                "num_steps": 3,
+                "seq_key": tuple(seq_ids),
+                "block_signature": tuple(
+                    tuple(blocks.block_tables[seq_id]) for seq_id in seq_ids
+                ),
+            }
+        },
+    }
+    scheduler._decode_graph_chain_started_keys.add(key)
+    monkeypatch.setattr(
+        scheduler,
+        "_decode_unrolled_graph_burst_is_eligible",
+        lambda seq_ids, num_steps: True,
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "_run_decode_step",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("unrolled burst returned to the one-token decode loop")
+        ),
+    )
+
+    finished = scheduler._decode_graph_token_burst_batch(3)
+
+    assert finished == []
+    assert graph.replays == 1
+    assert [request.generated_ids for request in requests] == [
+        [11, 12, 13, 14],
+        [21, 22, 23, 24],
+    ]
+    assert blocks.seq_lens == {0: 6, 1: 5}
+    assert scheduler._decode_graph_replay_count == 1
+    assert scheduler._decode_unrolled_graph_burst_replays == 1
+    assert scheduler._decode_unrolled_graph_bursts == 1
+    assert scheduler._decode_unrolled_graph_burst_steps == 3
+    stats = scheduler.get_stats()["decode_cuda_graphs"]
+    assert stats["unrolled_token_burst_enabled"] is True
+    assert stats["unrolled_token_burst_replays"] == 1
+    assert stats["unrolled_token_bursts"] == 1
+    assert stats["unrolled_token_burst_steps"] == 3
 
 
 def test_shared_decode_graph_is_invalidated_on_physical_kv_rebind(monkeypatch):

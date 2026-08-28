@@ -1912,7 +1912,12 @@ def test_gemma4_a4b_decode_graph_policy_is_exact():
 
 
 def test_gemma4_e2b_l4_native_decode_graph_policy_is_exact():
-    from megagemm.models.llama import _gemma4_l4_e2b_decode_graph_shape
+    from types import SimpleNamespace
+
+    from megagemm.models.llama import (
+        MegaGemmLlama,
+        _gemma4_l4_e2b_decode_graph_shape,
+    )
 
     class Config:
         model_type = "gemma4_text"
@@ -1946,6 +1951,23 @@ def test_gemma4_e2b_l4_native_decode_graph_policy_is_exact():
     )
     assert not _gemma4_l4_e2b_decode_graph_shape(
         Config(), **{**kwargs, "device_name": "NVIDIA A100-SXM4-80GB"}
+    )
+
+    model = SimpleNamespace(config=Config())
+    assert MegaGemmLlama.decode_unrolled_graph_burst_eligible(
+        model,
+        num_steps=8,
+        **kwargs,
+    )
+    assert not MegaGemmLlama.decode_unrolled_graph_burst_eligible(
+        model,
+        num_steps=1,
+        **kwargs,
+    )
+    assert not MegaGemmLlama.decode_unrolled_graph_burst_eligible(
+        model,
+        num_steps=9,
+        **kwargs,
     )
 
 

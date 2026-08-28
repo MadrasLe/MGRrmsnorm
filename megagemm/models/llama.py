@@ -11224,6 +11224,27 @@ class MegaGemmLlama(nn.Module):
             )
         )
 
+    def decode_unrolled_graph_burst_eligible(
+        self,
+        *,
+        num_seqs: int,
+        num_steps: int,
+        dtype: torch.dtype,
+        device_type: str,
+        device_name: str,
+    ) -> bool:
+        """Gate multi-token graph capture to the measured Gemma 4 E2B/L4 path."""
+        return bool(
+            1 < int(num_steps) <= 8
+            and _gemma4_l4_e2b_decode_graph_shape(
+                self.config,
+                num_seqs=num_seqs,
+                dtype=dtype,
+                device_type=device_type,
+                device_name=device_name,
+            )
+        )
+
     def _compute_per_layer_inputs(
         self,
         input_ids: torch.Tensor,

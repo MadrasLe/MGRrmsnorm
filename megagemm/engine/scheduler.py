@@ -267,6 +267,10 @@ class Scheduler:
             and _decode_native_ops is not None
             and hasattr(_decode_native_ops, "run_cuda_graph_token_burst")
         )
+        self._decode_unrolled_graph_burst = _env_bool(
+            "MEGAGEMM_DECODE_UNROLLED_GRAPH_BURST",
+            default=False,
+        )
         self._benchmark_forced_token_id = _env_int(
             "MEGAGEMM_BENCHMARK_FORCED_TOKEN_ID", -1
         )
@@ -459,6 +463,12 @@ class Scheduler:
         self._decode_graph_chain_input_updates_skipped = 0
         self._decode_native_graph_bursts = 0
         self._decode_native_graph_burst_steps = 0
+        self._decode_unrolled_graph_burst_captures = 0
+        self._decode_unrolled_graph_burst_replays = 0
+        self._decode_unrolled_graph_bursts = 0
+        self._decode_unrolled_graph_burst_steps = 0
+        self._decode_unrolled_graph_burst_failures = 0
+        self._decode_unrolled_graph_last_failure = ""
         self._decode_graph_chain_started_keys = set()
         self._decode_graph_last_feedback_persistent = False
         self._prefill_cuda_graphs = _env_bool(
@@ -569,6 +579,12 @@ class Scheduler:
         self._decode_graph_chain_input_updates_skipped = 0
         self._decode_native_graph_bursts = 0
         self._decode_native_graph_burst_steps = 0
+        self._decode_unrolled_graph_burst_captures = 0
+        self._decode_unrolled_graph_burst_replays = 0
+        self._decode_unrolled_graph_bursts = 0
+        self._decode_unrolled_graph_burst_steps = 0
+        self._decode_unrolled_graph_burst_failures = 0
+        self._decode_unrolled_graph_last_failure = ""
         self._decode_graph_chain_started_keys.clear()
         self._decode_graph_last_feedback_persistent = False
 
@@ -2087,6 +2103,7 @@ class Scheduler:
                     "seq_lens_signature": None,
                     "return_next_token": bool(return_next_token),
                     "chain_graph_inputs": bool(chain_graph_inputs),
+                    "unrolled_burst_graphs": {},
                 }
                 if self._decode_cuda_graph_shared_shape_cache:
                     state["input_ids"] = torch.empty(
@@ -2115,6 +2132,7 @@ class Scheduler:
             # capture even though the block-table contents are refreshed.
             state["graph"] = None
             state["logits"] = None
+            state["unrolled_burst_graphs"] = {}
             state.pop("graph_input_ids", None)
             state.pop("graph_positions", None)
             self._decode_graph_shape_warm_keys.discard(key)
@@ -2234,6 +2252,10 @@ class Scheduler:
         state["logits"] = logits
         state["graph_input_ids"] = input_ids
         state["graph_positions"] = positions
+        # Stream capture records the decode workload but does not execute the
+        # first autoregressive step.  Materialize it before returning logits.
+        graph.replay()
+        self._decode_graph_replay_count += 1
         self._mark_decode_graph_shape_state_synced(state, seq_ids)
         self._decode_graph_capture_count += 1
         self._log_decode_graph(
@@ -2365,6 +2387,7 @@ class Scheduler:
                 buf_ids, buf_pos, self.block_manager, seq_ids,
                 return_next_token=return_next_token,
             )
+        graph.replay()
         self._decode_graph_state = {
             'key': (tuple(seq_ids), bool(return_next_token)),
             'graph': graph,
@@ -2373,6 +2396,7 @@ class Scheduler:
             'return_next_token': bool(return_next_token),
         }
         self._decode_graph_capture_count += 1
+        self._decode_graph_replay_count += 1
         self._log_decode_graph(f"captured batch={len(seq_ids)}")
         return logits
 
@@ -2475,6 +2499,177 @@ class Scheduler:
             for sid in seq_ids
         )
         return state.get("block_signature") == block_signature
+
+    def _decode_unrolled_graph_burst_is_eligible(
+        self,
+        seq_ids: List[int],
+        num_steps: int,
+    ) -> bool:
+        """Keep multi-token graph capture on the audited E2B/L4 shape."""
+        if not (
+            self._decode_unrolled_graph_burst
+            and int(num_steps) > 1
+            and self._decode_graph_persistent_chain_ready(seq_ids)
+        ):
+            return False
+        checker = getattr(
+            self.model,
+            "decode_unrolled_graph_burst_eligible",
+            None,
+        )
+        if not callable(checker):
+            return False
+        try:
+            return bool(
+                checker(
+                    num_seqs=len(seq_ids),
+                    num_steps=int(num_steps),
+                    dtype=self.model.embed_tokens.weight.dtype,
+                    device_type="cuda",
+                    device_name=torch.cuda.get_device_name(),
+                )
+            )
+        except Exception:
+            return False
+
+    def _capture_decode_unrolled_graph_burst(
+        self,
+        *,
+        state: dict,
+        seq_ids: List[int],
+        output_tokens: torch.Tensor,
+        num_steps: int,
+    ) -> dict:
+        """Capture N autoregressive token steps as one CUDA Graph launch."""
+        input_ids = state.get("graph_input_ids")
+        positions = state.get("graph_positions")
+        if input_ids is None or positions is None:
+            raise RuntimeError(
+                "persistent graph inputs are missing for unrolled burst capture"
+            )
+        if tuple(output_tokens.shape) != (len(seq_ids), int(num_steps)):
+            raise RuntimeError(
+                "unrolled graph output must have shape [num_seqs, num_steps]"
+            )
+
+        setter = getattr(self.block_manager, "set_decode_metadata_override", None)
+        clearer = getattr(self.block_manager, "clear_decode_metadata_override", None)
+        if setter is None or clearer is None:
+            raise RuntimeError("BlockManager lacks CUDA Graph metadata overrides")
+
+        graph = torch.cuda.CUDAGraph()
+        python_seq_lens_before = {
+            int(sid): int(self.block_manager.seq_lens[int(sid)])
+            for sid in seq_ids
+        }
+        setter(
+            state["block_table"],
+            state["seq_lens"],
+            int(state.get("max_decode_blocks") or state["block_table"].shape[1]),
+        )
+        try:
+            torch.cuda.synchronize()
+            with torch.cuda.graph(graph):
+                for step in range(int(num_steps)):
+                    next_tokens = self.model.decode_step(
+                        input_ids,
+                        positions,
+                        self.block_manager,
+                        seq_ids,
+                        return_next_token=True,
+                    ).reshape(len(seq_ids))
+                    output_tokens[:, step].copy_(next_tokens)
+                    # The final feedback is intentional: the next burst resumes
+                    # from graph-owned token/position buffers without a host copy.
+                    input_ids.copy_(next_tokens.reshape_as(input_ids))
+                    positions.add_(1)
+        except Exception:
+            # decode_step updates the Python sequence-length dictionary while the
+            # CUDA operations are captured.  Restore it before surfacing a failed
+            # capture; replaying or falling back after a partial capture is unsafe.
+            for sid, length in python_seq_lens_before.items():
+                self.block_manager.seq_lens[int(sid)] = int(length)
+            raise
+        finally:
+            clearer()
+
+        # Capture recorded all N dependent steps.  One replay performs the
+        # actual burst and materializes every output token.
+        graph.replay()
+        self._decode_graph_replay_count += 1
+        self._decode_unrolled_graph_burst_replays += 1
+
+        entry = {
+            "graph": graph,
+            "output_tokens": output_tokens,
+            "num_steps": int(num_steps),
+            "seq_key": tuple(int(sid) for sid in seq_ids),
+            "block_signature": state.get("block_signature"),
+        }
+        state.setdefault("unrolled_burst_graphs", {})[int(num_steps)] = entry
+        self._mark_decode_graph_shape_state_synced(state, seq_ids)
+        self._decode_unrolled_graph_burst_captures += 1
+        self._log_decode_graph(
+            f"captured unrolled burst batch={len(seq_ids)} steps={int(num_steps)}"
+        )
+        return entry
+
+    def _run_unrolled_decode_graph_token_burst(
+        self,
+        seq_ids: List[int],
+        burst_tokens: torch.Tensor,
+        num_steps: int,
+    ) -> bool:
+        """Capture or replay one graph containing the complete token burst."""
+        if not self._decode_unrolled_graph_burst_is_eligible(seq_ids, num_steps):
+            return False
+        key = self._decode_graph_shape_key(
+            seq_ids,
+            return_next_token=True,
+            chain_graph_inputs=True,
+        )
+        state = self._decode_graph_shape_states.get(key)
+        if state is None:
+            return False
+
+        entries = state.setdefault("unrolled_burst_graphs", {})
+        entry = entries.get(int(num_steps))
+        try:
+            if entry is None:
+                entry = self._capture_decode_unrolled_graph_burst(
+                    state=state,
+                    seq_ids=seq_ids,
+                    output_tokens=burst_tokens,
+                    num_steps=int(num_steps),
+                )
+                # Capture executed the device work and decode_step kept the
+                # Python sequence-length dictionary synchronized.
+            else:
+                if entry.get("seq_key") != tuple(int(sid) for sid in seq_ids):
+                    raise RuntimeError("unrolled graph sequence membership changed")
+                if entry.get("block_signature") != state.get("block_signature"):
+                    raise RuntimeError("unrolled graph physical KV layout changed")
+                entry["graph"].replay()
+                self._decode_graph_replay_count += 1
+                self._decode_unrolled_graph_burst_replays += 1
+                self._advance_decode_graph_python_seq_lens(seq_ids, int(num_steps))
+                self._mark_decode_graph_shape_state_synced(state, seq_ids)
+
+            graph_output = entry["output_tokens"]
+            if graph_output.data_ptr() != burst_tokens.data_ptr():
+                burst_tokens.copy_(graph_output)
+        except Exception as exc:
+            self._decode_unrolled_graph_burst_failures += 1
+            self._decode_unrolled_graph_last_failure = (
+                f"{type(exc).__name__}: {exc}"
+            )
+            raise
+
+        self._decode_graph_last_feedback_persistent = True
+        self._decode_graph_persistent_feedback_steps += int(num_steps)
+        self._decode_unrolled_graph_bursts += 1
+        self._decode_unrolled_graph_burst_steps += int(num_steps)
+        return True
 
     def _run_native_decode_graph_token_burst(
         self,
@@ -2662,15 +2857,24 @@ class Scheduler:
             self._decode_vectorized_input_updates += 1
 
         burst_tokens = self._decode_burst_tokens[:num_seqs, :actual_steps]
-        native_burst = bool(
+        unrolled_burst = bool(
             resume_persistent_chain
+            and self._run_unrolled_decode_graph_token_burst(
+                seq_ids,
+                burst_tokens,
+                actual_steps,
+            )
+        )
+        native_burst = bool(
+            not unrolled_burst
+            and resume_persistent_chain
             and self._run_native_decode_graph_token_burst(
                 seq_ids,
                 burst_tokens,
                 actual_steps,
             )
         )
-        if not native_burst:
+        if not unrolled_burst and not native_burst:
             for step in range(actual_steps):
                 next_tokens = self._run_decode_step(
                     seq_ids,
@@ -2960,6 +3164,24 @@ class Scheduler:
                 'native_token_burst_steps': int(
                     self._decode_native_graph_burst_steps
                 ),
+                'unrolled_token_burst_enabled': bool(
+                    self._decode_unrolled_graph_burst
+                ),
+                'unrolled_token_burst_captures': int(
+                    self._decode_unrolled_graph_burst_captures
+                ),
+                'unrolled_token_burst_replays': int(
+                    self._decode_unrolled_graph_burst_replays
+                ),
+                'unrolled_token_bursts': int(
+                    self._decode_unrolled_graph_bursts
+                ),
+                'unrolled_token_burst_steps': int(
+                    self._decode_unrolled_graph_burst_steps
+                ),
+                'unrolled_token_burst_failures': int(
+                    self._decode_unrolled_graph_burst_failures
+                ),
                 'chain_input_updates_skipped': int(
                     self._decode_graph_chain_input_updates_skipped
                 ),
@@ -2973,6 +3195,10 @@ class Scheduler:
             if self._decode_graph_last_failure:
                 stats['decode_cuda_graphs']['last_failure'] = (
                     self._decode_graph_last_failure
+                )
+            if self._decode_unrolled_graph_last_failure:
+                stats['decode_cuda_graphs']['unrolled_token_burst_last_failure'] = (
+                    self._decode_unrolled_graph_last_failure
                 )
         if 'decode_cuda_graphs' not in stats:
             # Keep disabled eager runs auditable.  Previously this all-zero
