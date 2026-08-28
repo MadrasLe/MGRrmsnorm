@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import csv
 import gc
+import hashlib
 import importlib.metadata
 import json
 import os
@@ -770,6 +771,28 @@ def load_megagemm_runner(args: argparse.Namespace, tokenizer):
         elapsed_s = time.perf_counter() - start
         scheduler = getattr(engine, "_last_scheduler", None)
         scheduler_stats = scheduler.get_stats() if scheduler is not None else {}
+        token_digest = None
+        generated_token_lengths = None
+        if (
+            os.environ.get("MEGAGEMM_BENCHMARK_TOKEN_DIGEST", "").strip().lower()
+            in {"1", "true", "yes", "on"}
+            and scheduler is not None
+        ):
+            completed = sorted(
+                getattr(scheduler, "_completed", ()) or (),
+                key=lambda request: int(request.request_id),
+            )
+            token_rows = [
+                [int(token_id) for token_id in request.generated_ids]
+                for request in completed
+            ]
+            encoded = json.dumps(
+                token_rows,
+                separators=(",", ":"),
+                ensure_ascii=True,
+            ).encode("ascii")
+            token_digest = hashlib.sha256(encoded).hexdigest()
+            generated_token_lengths = [len(row) for row in token_rows]
         generated_tokens = int(
             scheduler_stats.get("total_tokens")
             or count_generated_text_tokens(tokenizer, list(outputs))
@@ -780,6 +803,8 @@ def load_megagemm_runner(args: argparse.Namespace, tokenizer):
             "generated_tokens": generated_tokens,
             "extra": {
                 "scheduler_stats": scheduler_stats,
+                "generated_token_digest": token_digest,
+                "generated_token_lengths": generated_token_lengths,
                 "engine_init_timing": getattr(engine, "_init_timing", None),
                 **megagemm_diagnostics(engine),
             },

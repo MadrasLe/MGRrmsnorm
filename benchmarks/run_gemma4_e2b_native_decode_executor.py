@@ -77,6 +77,7 @@ def _environment(overrides: dict[str, str]) -> dict[str, str]:
             "MEGAGEMM_DECODE_CUDA_GRAPHS_STABLE_MAX_BLOCKS": "1",
             "MEGAGEMM_DECODE_GRAPH_TOKEN_BURST": "1",
             "MEGAGEMM_MULTI_STEP_BURST_BATCH": "8",
+            "MEGAGEMM_BENCHMARK_TOKEN_DIGEST": "1",
             "MEGAGEMM_GEMMA4_DENSE_POST_NORM_CHAIN_DECODE": "1",
             "MEGAGEMM_GEMMA4_E2B_L4_SLIDING_PREFILL": "1",
             # Hold the validated B8 MLP policy fixed across all three cases.
@@ -118,6 +119,7 @@ def _case_result(name: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
     decode_tps = []
     graph_stats = []
     generated = []
+    token_digests = []
     for row in rows:
         tokens = int(row.get("generated_tokens", 0) or 0)
         stats = row.get("scheduler_stats") or {}
@@ -128,6 +130,16 @@ def _case_result(name: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
         decode_ms.append(milliseconds)
         decode_tps.append(tokens / (milliseconds / 1000.0))
         graph_stats.append(dict(stats.get("decode_cuda_graphs") or {}))
+        digest = str(row.get("generated_token_digest") or "")
+        if len(digest) != 64:
+            raise RuntimeError(f"{name} row is missing its generated-token digest")
+        token_digests.append(digest)
+
+    unique_digests = sorted(set(token_digests))
+    if len(unique_digests) != 1:
+        raise RuntimeError(
+            f"{name} was not token-deterministic across repeats: {unique_digests}"
+        )
 
     result = {
         "name": name,
@@ -137,6 +149,7 @@ def _case_result(name: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
         "median_output_tps": statistics.median(output_tps),
         "median_decode_tps": statistics.median(decode_tps),
         "median_decode_ms": statistics.median(decode_ms),
+        "generated_token_digest": unique_digests[0],
         "graph_stats": graph_stats,
     }
     failures = sum(int(stats.get("failures", 0) or 0) for stats in graph_stats)
@@ -289,19 +302,29 @@ def main() -> int:
     native_vs_eager = 0.0
     native_vs_python_graph = 0.0
     if eager and python_graph and native:
-        native_vs_eager = (
-            float(native["median_decode_tps"]) / float(eager["median_decode_tps"]) - 1.0
-        ) * 100.0
-        native_vs_python_graph = (
-            float(native["median_decode_tps"])
-            / float(python_graph["median_decode_tps"])
-            - 1.0
-        ) * 100.0
-        decision = (
-            "PROMOTE_NATIVE_EXECUTOR"
-            if native_vs_eager >= 2.0 and native_vs_python_graph >= 0.5
-            else "KEEP_EXPERIMENTAL"
-        )
+        digests = {
+            str(eager["generated_token_digest"]),
+            str(python_graph["generated_token_digest"]),
+            str(native["generated_token_digest"]),
+        }
+        if len(digests) != 1:
+            decision = "CORRECTNESS_FAILURE"
+        else:
+            native_vs_eager = (
+                float(native["median_decode_tps"])
+                / float(eager["median_decode_tps"])
+                - 1.0
+            ) * 100.0
+            native_vs_python_graph = (
+                float(native["median_decode_tps"])
+                / float(python_graph["median_decode_tps"])
+                - 1.0
+            ) * 100.0
+            decision = (
+                "PROMOTE_NATIVE_EXECUTOR"
+                if native_vs_eager >= 2.0 and native_vs_python_graph >= 0.5
+                else "KEEP_EXPERIMENTAL"
+            )
 
     payload = {
         "decision": decision,
@@ -313,6 +336,8 @@ def main() -> int:
     decision_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     print("\nDECISION " + json.dumps(payload, separators=(",", ":")))
     print(f"wrote {decision_path}")
+    if decision == "CORRECTNESS_FAILURE":
+        return 3
     return 0 if len(successful) == len(CASES) else 2
 
 
