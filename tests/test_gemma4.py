@@ -2453,6 +2453,40 @@ def test_fused_rmsnorm_linear_fallback_matches_reference():
     assert torch.allclose(out, expected, atol=1e-6, rtol=1e-6)
 
 
+def test_fused_rmsnorm_linear_row_override_is_local_to_the_call(monkeypatch):
+    import importlib
+
+    fused_module = importlib.import_module(
+        "megagemm.kernels.fused_rmsnorm_linear"
+    )
+    monkeypatch.setattr(fused_module, "_CFG_FORCE_TRITON", False)
+    monkeypatch.setattr(fused_module, "_CFG_SHAPE_GUARD", True)
+    monkeypatch.setattr(fused_module, "_CFG_MAX_ROWS", 4)
+    monkeypatch.setattr(fused_module, "_CFG_MIN_K", 1024)
+    monkeypatch.setattr(fused_module, "_CFG_MIN_N", 1024)
+
+    assert not fused_module.fused_rmsnorm_linear_prefers_triton_shape(
+        1536,
+        12288,
+        8,
+        mode="decode",
+    )
+    assert fused_module.fused_rmsnorm_linear_prefers_triton_shape(
+        1536,
+        12288,
+        8,
+        mode="decode",
+        max_rows_override=8,
+    )
+    assert not fused_module.fused_rmsnorm_linear_prefers_triton_shape(
+        1536,
+        12288,
+        9,
+        mode="decode",
+        max_rows_override=8,
+    )
+
+
 def test_eos_token_id_lists_are_normalized():
     assert _normalize_token_id_set([1, 106], None, torch.tensor([7])) == {1, 7, 106}
 

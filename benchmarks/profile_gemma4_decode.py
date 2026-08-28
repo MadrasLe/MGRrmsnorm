@@ -1,14 +1,18 @@
 """
 Profile Gemma 4 decode on MegaGemm with torch.profiler + model timing buckets.
 
-Designed for Kaggle / Colab T4 runs:
+Designed for Kaggle / Colab GPU runs. The profiler keeps the validated
+production decode fusions enabled while collecting the internal CUDA-event
+breakdown.
 
     python benchmarks/profile_gemma4_decode.py \
       --model google/gemma-4-E2B-it \
-      --dtype fp16 \
-      --batch-size 4 \
-      --max-new-tokens 64 \
-      --out gemma4_decode_profile.json
+      --dtype bf16 \
+      --batch-size 8 \
+      --prompt-tokens 2048 \
+      --max-new-tokens 32 \
+      --ignore-eos \
+      --out /tmp/gemma4_e2b_l4_decode_profile.json
 """
 
 from __future__ import annotations
@@ -86,6 +90,12 @@ def main() -> int:
     parser.add_argument("--dtype", default="fp16", choices=["fp16", "bf16", "fp32"])
     parser.add_argument("--quantize", choices=["int8", "fp8", "awq"])
     parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument(
+        "--prompt-tokens",
+        type=int,
+        default=0,
+        help="Build an exact synthetic prompt per request; 0 uses --prompt.",
+    )
     parser.add_argument("--max-new-tokens", type=int, default=64)
     parser.add_argument("--warmup-tokens", type=int, default=8)
     parser.add_argument("--max-seq-len", type=int, default=1024)
@@ -100,6 +110,7 @@ def main() -> int:
     parser.add_argument("--top-k", type=int, default=0)
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--repetition-penalty", type=float, default=1.0)
+    parser.add_argument("--ignore-eos", action="store_true")
     parser.add_argument("--out", default="gemma4_decode_profile.json")
     args = parser.parse_args()
 
@@ -112,14 +123,13 @@ def main() -> int:
 
     dtype = _runtime_dtype(args.dtype)
     max_batch_size = args.max_batch_size or args.batch_size
-    prompts = [args.prompt] * args.batch_size
-
     print("MegaGemm Gemma4 decode profiler")
     print(f"  model:          {args.model}")
     print(f"  device:         {args.device}")
     print(f"  dtype:          {args.dtype}")
     print(f"  quantize:       {args.quantize or 'none'}")
     print(f"  batch_size:     {args.batch_size}")
+    print(f"  prompt_tokens:  {args.prompt_tokens or 'text prompt'}")
     print(f"  max_new_tokens: {args.max_new_tokens}")
     print(f"  gpu:            {_gpu_snapshot()}")
     print(f"  decode_timing:  {os.environ.get('MEGAGEMM_DECODE_TIMING')}")
@@ -137,6 +147,24 @@ def main() -> int:
         num_blocks=args.num_blocks,
         kv_alloc=args.kv_alloc,
     )
+    if args.prompt_tokens > 0:
+        from benchmarks.benchmark_inference_matrix import build_prompts
+
+        prompts, prompt_tokens_actual = build_prompts(
+            engine.tokenizer,
+            args.batch_size,
+            args.prompt_tokens,
+        )
+    else:
+        prompts = [args.prompt] * args.batch_size
+        prompt_tokens_actual = sum(
+            len(engine.tokenizer.encode(prompt, add_special_tokens=False))
+            for prompt in prompts
+        )
+    print(f"  prompt_actual:  {prompt_tokens_actual} total tokens")
+
+    runtime_stats_fn = getattr(engine.model, "decode_runtime_stats", None)
+    runtime_before = runtime_stats_fn() if callable(runtime_stats_fn) else {}
 
     warmup_tokens = min(args.warmup_tokens, args.max_new_tokens)
     if warmup_tokens > 0:
@@ -147,6 +175,7 @@ def main() -> int:
             temperature=args.temperature,
             top_k=args.top_k,
             top_p=args.top_p,
+            ignore_eos=args.ignore_eos,
         )
         _sync(args.device)
 
@@ -159,6 +188,7 @@ def main() -> int:
         top_k=args.top_k,
         top_p=args.top_p,
         repetition_penalty=args.repetition_penalty,
+        ignore_eos=args.ignore_eos,
     )
     _sync(args.device)
 
@@ -166,6 +196,7 @@ def main() -> int:
     scheduler = getattr(engine, "_last_scheduler", None)
     if scheduler is not None:
         scheduler_stats = scheduler.get_stats()
+    runtime_after = runtime_stats_fn() if callable(runtime_stats_fn) else {}
 
     decode_total = float(summary.get("decode_total_ms", 0.0) or 0.0)
     print(f"\nScheduler stats: {scheduler_stats}")
@@ -208,9 +239,33 @@ def main() -> int:
                 ("decode_mlp_act_ms", "activation"),
                 ("decode_mlp_down_ms", "down_proj"),
                 ("decode_mlp_output_norm_ms", "output_norm"),
+                ("decode_dense_post_norm_chain_ms", "dense_tail_chain"),
             ],
             "decode_mlp_ms",
         )
+
+    counter_keys = (
+        "gemma4_flat_fused_qkv_layers",
+        "gemma4_flat_fused_gateup_hits",
+        "gemma4_flat_deepfusion_hits",
+        "gemma4_dense_post_norm_chain_decode_hits",
+        "gemma4_dense_next_attn_norm_decode_hits",
+    )
+    runtime_counter_delta = {}
+    for key in counter_keys:
+        before = runtime_before.get(key, 0)
+        after = runtime_after.get(key, 0)
+        if isinstance(before, (int, float)) and isinstance(after, (int, float)):
+            runtime_counter_delta[key] = after - before
+    paged_before = runtime_before.get("paged_decode_runtime") or {}
+    paged_after = runtime_after.get("paged_decode_runtime") or {}
+    for key in ("gqa2_direct_hits", "generic_direct_hits"):
+        before = paged_before.get(key, 0)
+        after = paged_after.get(key, 0)
+        if isinstance(before, (int, float)) and isinstance(after, (int, float)):
+            runtime_counter_delta[f"paged_decode_{key}"] = after - before
+    print("\nProduction fast-path counter deltas")
+    print(json.dumps(runtime_counter_delta, indent=2))
 
     print("\nTorch Profiler Buckets")
     for key in (
@@ -237,7 +292,11 @@ def main() -> int:
     payload = {
         "args": vars(args),
         "gpu": _gpu_snapshot(),
+        "prompt_tokens_actual_total": prompt_tokens_actual,
         "scheduler_stats": scheduler_stats,
+        "decode_runtime_before": runtime_before,
+        "decode_runtime_after": runtime_after,
+        "decode_runtime_counter_delta": runtime_counter_delta,
         "summary": summary,
     }
     out_path = Path(args.out)

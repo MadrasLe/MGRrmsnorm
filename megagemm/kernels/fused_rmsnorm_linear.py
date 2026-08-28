@@ -269,6 +269,7 @@ def fused_rmsnorm_linear_prefers_triton_shape(
     out_dim: int,
     rows: int,
     mode: str = "decode",
+    max_rows_override: Optional[int] = None,
 ) -> bool:
     if mode == "prefill":
         if _CFG_PREFILL_FORCE_TRITON:
@@ -286,7 +287,12 @@ def fused_rmsnorm_linear_prefers_triton_shape(
         return True
     if not _CFG_SHAPE_GUARD:
         return True
-    if rows > _CFG_MAX_ROWS:
+    max_rows = (
+        max(1, int(max_rows_override))
+        if max_rows_override is not None
+        else _CFG_MAX_ROWS
+    )
+    if rows > max_rows:
         return False
     if in_dim < _CFG_MIN_K:
         return False
@@ -306,6 +312,7 @@ def fused_rmsnorm_linear(
     mode: str = "decode",
     inv_rms: Optional[torch.Tensor] = None,
     two_pass: Optional[bool] = None,
+    max_rows_override: Optional[int] = None,
 ) -> torch.Tensor:
     """
     Decode-oriented fused RMSNorm + Linear.
@@ -330,7 +337,13 @@ def fused_rmsnorm_linear(
         and linear_weight.is_cuda
         and norm_weight.is_cuda
         and not torch.is_grad_enabled()
-        and fused_rmsnorm_linear_prefers_triton_shape(k_dim, n_dim, m_rows, mode=mode)
+        and fused_rmsnorm_linear_prefers_triton_shape(
+            k_dim,
+            n_dim,
+            m_rows,
+            mode=mode,
+            max_rows_override=max_rows_override,
+        )
     )
 
     if out is None:

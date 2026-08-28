@@ -62,6 +62,34 @@ def test_non_a100_keeps_conservative_split_ceiling():
         _restore_split_env(saved_env)
 
 
+def test_model_split_policy_is_used_but_explicit_environment_wins():
+    saved_env = _clear_split_env()
+    old_device_info = paged_attention._cuda_device_info
+    try:
+        paged_attention._cuda_device_info = (
+            lambda _device=None: ((8, 9), "NVIDIA L4", 58)
+        )
+        assert paged_attention._get_decode_split_count(
+            1,
+            8,
+            136,
+            device=torch.device("cuda"),
+            policy_override=1,
+        ) == 1
+
+        os.environ["MEGAGEMM_PAGED_DECODE_SPLITS"] = "4"
+        assert paged_attention._get_decode_split_count(
+            1,
+            8,
+            136,
+            device=torch.device("cuda"),
+            policy_override=1,
+        ) == 4
+    finally:
+        paged_attention._cuda_device_info = old_device_info
+        _restore_split_env(saved_env)
+
+
 def test_gemma4_h256_gqa2_direct_decode_is_explicit_and_unsplit_only():
     name = "MEGAGEMM_PAGED_DECODE_GQA2"
     saved_value = os.environ.get(name)
@@ -86,6 +114,47 @@ def test_gemma4_h256_gqa2_direct_decode_is_explicit_and_unsplit_only():
             num_kv_heads=8,
             head_dim=256,
             num_splits=2,
+        )
+    finally:
+        paged_attention._GQA2_DECODE_DISABLED = saved_disabled
+        if saved_value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = saved_value
+
+
+def test_gqa2_model_policy_is_used_but_explicit_environment_wins():
+    name = "MEGAGEMM_PAGED_DECODE_GQA2"
+    saved_value = os.environ.pop(name, None)
+    saved_disabled = paged_attention._GQA2_DECODE_DISABLED
+    try:
+        paged_attention._GQA2_DECODE_DISABLED = False
+        kwargs = {
+            "num_q_heads": 16,
+            "num_kv_heads": 8,
+            "head_dim": 256,
+            "num_splits": 1,
+        }
+
+        assert paged_attention._use_gqa2_direct_decode(
+            **kwargs,
+            policy_enabled=True,
+        )
+        assert not paged_attention._use_gqa2_direct_decode(
+            **kwargs,
+            policy_enabled=False,
+        )
+
+        os.environ[name] = "0"
+        assert not paged_attention._use_gqa2_direct_decode(
+            **kwargs,
+            policy_enabled=True,
+        )
+
+        os.environ[name] = "1"
+        assert paged_attention._use_gqa2_direct_decode(
+            **kwargs,
+            policy_enabled=False,
         )
     finally:
         paged_attention._GQA2_DECODE_DISABLED = saved_disabled

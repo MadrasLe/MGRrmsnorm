@@ -22,7 +22,7 @@ import torch
 import torch.nn as nn
 
 from .sparsity import is_semi_structured_weight
-from .runtime_policy import resolve_runtime_policy
+from .runtime_policy import policy_bool, policy_rows, resolve_runtime_policy
 
 try:
     from ..kernels.sparse24_mma import (
@@ -36,6 +36,7 @@ from ..kernels.paged_attention import (
     prefill_attention,
     packed_prefill_attention,
     fused_rope_kv_write,
+    gemma4_e2b_l4_sliding_prefill_attention,
     gemma4_long_sliding_prefill_attention,
     gemma4_long_full_prefill_attention,
     paged_decode_runtime_stats,
@@ -4695,6 +4696,8 @@ class LlamaAttention(nn.Module):
         self._gemma4_fused_attn_prepare_skip_reason = ""
         self._gemma4_fused_attn_prepare_disabled = False
         self._gemma4_implicit_causal_prefill_hits = 0
+        self._gemma4_e2b_l4_sliding_prefill_enabled = False
+        self._gemma4_e2b_l4_sliding_prefill_hits = 0
         self._gemma4_long_sliding_prefill_hits = 0
         self._gemma4_long_full_prefill_hits = 0
         self._prefill_prepared_q = None
@@ -4863,6 +4866,21 @@ class LlamaAttention(nn.Module):
                 scale=self.scale,
             )
 
+        if (
+            implicit_causal
+            and self._gemma4_e2b_l4_sliding_prefill_enabled
+        ):
+            e2b_l4_out = gemma4_e2b_l4_sliding_prefill_attention(
+                q,
+                k,
+                v,
+                sliding_window=int(self.sliding_window),
+                scale=self.scale,
+            )
+            if e2b_l4_out is not None:
+                self._gemma4_e2b_l4_sliding_prefill_hits += 1
+                return e2b_l4_out
+
         if implicit_causal and _GEMMA4_LONG_SLIDING_PREFILL:
             long_sliding_out = gemma4_long_sliding_prefill_attention(
                 q,
@@ -4882,7 +4900,10 @@ class LlamaAttention(nn.Module):
             q.device,
             q.dtype,
         )
-        if attn_mask is not None:
+        # A uniform implicit-causal batch has no padding.  The local mask is
+        # already causal, so adding the Bx1xSxS global mask only materializes a
+        # redundant batch-expanded tensor (the L4 gate measured it bit-exact).
+        if attn_mask is not None and not implicit_causal:
             local_mask = local_mask + attn_mask
         return prefill_attention(
             q,
@@ -10787,6 +10808,10 @@ class MegaGemmLlama(nn.Module):
         self._gemma4_flat_dense_post_norm_chain_hits = 0
         self._gemma4_flat_dense_next_attn_norm_hits = 0
         self._gemma4_flat_dense_next_attn_norm_bufs = None
+        self._gemma4_flat_policy_fused_gateup_rows = ()
+        self._gemma4_flat_policy_deepfusion_rows = ()
+        self._gemma4_flat_policy_cublas_gateup_rows = ()
+        self._gemma4_flat_policy_cublas_down_rows = ()
         self._gemma4_flat_fused_router_expert_input_norm_enabled = False
         self._gemma4_flat_fused_router_expert_input_norm_hits = 0
         self._gemma4_flat_expert_input_bufs = None
@@ -10955,6 +10980,17 @@ class MegaGemmLlama(nn.Module):
             self.config,
             device_name=device_name,
         )
+        e2b_l4_sliding_prefill = policy_bool(
+            self,
+            "MEGAGEMM_GEMMA4_E2B_L4_SLIDING_PREFILL",
+            "gemma4_e2b_l4_sliding_prefill",
+        )
+        for layer in self.layers:
+            attention = getattr(layer, "self_attn", None)
+            if attention is not None:
+                attention._gemma4_e2b_l4_sliding_prefill_enabled = bool(
+                    e2b_l4_sliding_prefill
+                )
         explicit_rmsnorm = os.environ.get(
             "MEGAGEMM_DISABLE_CUDA_RMSNORM", ""
         ).strip()
@@ -12704,6 +12740,28 @@ class MegaGemmLlama(nn.Module):
             int(getattr(attn, "_gemma4_implicit_causal_prefill_hits", 0))
             for attn in full_attn_layers
         )
+        gemma4_e2b_l4_sliding_prefill_hits = sum(
+            int(
+                getattr(
+                    attn,
+                    "_gemma4_e2b_l4_sliding_prefill_hits",
+                    0,
+                )
+            )
+            for attn in full_attn_layers
+        )
+        gemma4_e2b_l4_sliding_prefill_enabled_layers = sum(
+            int(
+                bool(
+                    getattr(
+                        attn,
+                        "_gemma4_e2b_l4_sliding_prefill_enabled",
+                        False,
+                    )
+                )
+            )
+            for attn in full_attn_layers
+        )
         gemma4_long_sliding_prefill_hits = sum(
             int(getattr(attn, "_gemma4_long_sliding_prefill_hits", 0))
             for attn in full_attn_layers
@@ -13021,6 +13079,15 @@ class MegaGemmLlama(nn.Module):
             ),
             "gemma4_implicit_causal_prefill_hits": int(
                 gemma4_implicit_causal_prefill_hits
+            ),
+            "gemma4_e2b_l4_sliding_prefill_enabled": bool(
+                gemma4_e2b_l4_sliding_prefill_enabled_layers > 0
+            ),
+            "gemma4_e2b_l4_sliding_prefill_enabled_layers": int(
+                gemma4_e2b_l4_sliding_prefill_enabled_layers
+            ),
+            "gemma4_e2b_l4_sliding_prefill_hits": int(
+                gemma4_e2b_l4_sliding_prefill_hits
             ),
             "gemma4_long_sliding_prefill_enabled": bool(
                 _GEMMA4_LONG_SLIDING_PREFILL
@@ -13802,6 +13869,9 @@ class MegaGemmLlama(nn.Module):
             "gemma4_flat_fused_gateup_hits": int(
                 getattr(self, "_gemma4_flat_fused_gateup_hits", 0)
             ),
+            "gemma4_policy_bf16_fused_gateup_rows": list(
+                getattr(self, "_gemma4_flat_policy_fused_gateup_rows", ())
+            ),
             "gemma4_flat_fused_qkv_layers": int(
                 sum(
                     getattr(layer, "qkv_wt", None) is not None
@@ -13813,6 +13883,15 @@ class MegaGemmLlama(nn.Module):
             ),
             "gemma4_flat_deepfusion_hits": int(
                 getattr(self, "_gemma4_flat_deepfusion_hits", 0)
+            ),
+            "gemma4_policy_bf16_deepfusion_rows": list(
+                getattr(self, "_gemma4_flat_policy_deepfusion_rows", ())
+            ),
+            "gemma4_policy_bf16_cublas_gateup_rows": list(
+                getattr(self, "_gemma4_flat_policy_cublas_gateup_rows", ())
+            ),
+            "gemma4_policy_bf16_cublas_down_rows": list(
+                getattr(self, "_gemma4_flat_policy_cublas_down_rows", ())
             ),
             "gemma4_dense_post_norm_chain_decode_enabled": bool(
                 getattr(
@@ -15325,6 +15404,26 @@ class MegaGemmLlama(nn.Module):
             self._flat_gemma4_max_ple = max_ple
             self._gemma4_flat_fused_gateup_use_cache = {}
             self._gemma4_flat_deepfusion_use_cache = {}
+            self._gemma4_flat_policy_fused_gateup_rows = policy_rows(
+                self,
+                "MEGAGEMM_GEMMA4_FORCE_FUSED_GATEUP_USE",
+                "gemma4_bf16_fused_gateup_rows",
+            )
+            self._gemma4_flat_policy_deepfusion_rows = policy_rows(
+                self,
+                "MEGAGEMM_GEMMA4_FORCE_DEEPFUSION_USE",
+                "gemma4_bf16_deepfusion_rows",
+            )
+            self._gemma4_flat_policy_cublas_gateup_rows = policy_rows(
+                self,
+                "MEGAGEMM_GEMMA4_FORCE_FUSED_GATEUP_USE",
+                "gemma4_bf16_cublas_gateup_rows",
+            )
+            self._gemma4_flat_policy_cublas_down_rows = policy_rows(
+                self,
+                "MEGAGEMM_GEMMA4_FORCE_DEEPFUSION_USE",
+                "gemma4_bf16_cublas_down_rows",
+            )
             self._gemma4_flat_fused_gateup_runtime_disabled = False
             self._gemma4_flat_fused_gateup_hits = 0
             self._gemma4_flat_deepfusion_hits = 0
@@ -15871,11 +15970,16 @@ class MegaGemmLlama(nn.Module):
                 if self._gemma4_flat_fused_next_attn_norm_supported
                 else None
             )
+            dense_post_norm_chain_requested = policy_bool(
+                self,
+                "MEGAGEMM_GEMMA4_DENSE_POST_NORM_CHAIN_DECODE",
+                "gemma4_dense_post_norm_chain",
+                default=_GEMMA4_DENSE_POST_NORM_CHAIN_DECODE,
+            )
             self._gemma4_flat_dense_post_norm_chain_enabled = bool(
-                _GEMMA4_DENSE_POST_NORM_CHAIN_DECODE
+                dense_post_norm_chain_requested
                 and callable(rmsnorm_triton_residual_scale_next)
-                and self.runtime_policy.name
-                in {"gemma4-e2b-l4", "gemma4-e4b-l4"}
+                and self.runtime_policy.name == "gemma4-e2b-l4"
                 and all(
                     not lw.is_moe and int(lw.layer_scalar.numel()) == 1
                     for lw in weights
@@ -16258,6 +16362,27 @@ class MegaGemmLlama(nn.Module):
             return False
         out_features = 2 * lw.intermediate_size
         rows = int(hidden.shape[0]) if hidden.dim() == 2 else int(hidden.shape[0] * hidden.shape[1])
+        policy_force_fused_gateup = bool(
+            hidden.dtype == torch.bfloat16
+            and rows
+            in getattr(self, "_gemma4_flat_policy_fused_gateup_rows", ())
+        )
+        policy_cublas_gateup = bool(
+            hidden.dtype == torch.bfloat16
+            and rows
+            in getattr(self, "_gemma4_flat_policy_cublas_gateup_rows", ())
+        )
+        if policy_cublas_gateup:
+            _gemma4_log_mlp_fusion(
+                self,
+                "gateup",
+                f"measured cuBLAS policy retained for BF16 rows={rows}",
+            )
+            return False
+        force_fused_gateup = bool(
+            _GEMMA4_FORCE_FUSED_GATEUP_USE or policy_force_fused_gateup
+        )
+        max_rows_override = rows if force_fused_gateup else None
         tuned_a4b = _gemma4_a100_a4b_tuned_mlp_shape(
             rows,
             int(hidden.shape[-1]),
@@ -16273,13 +16398,14 @@ class MegaGemmLlama(nn.Module):
             )
             return False
         if (
-            not _GEMMA4_FORCE_FUSED_GATEUP_USE
+            not force_fused_gateup
             and callable(fused_rmsnorm_linear_prefers_triton_shape)
             and not fused_rmsnorm_linear_prefers_triton_shape(
                 int(hidden.shape[-1]),
                 int(out_features),
                 rows,
                 mode="decode",
+                max_rows_override=max_rows_override,
             )
         ):
             _gemma4_log_mlp_fusion(
@@ -16296,7 +16422,8 @@ class MegaGemmLlama(nn.Module):
             hidden.dtype,
             hidden.device.type,
             hidden.device.index,
-            bool(_GEMMA4_FORCE_FUSED_GATEUP_USE),
+            force_fused_gateup,
+            policy_force_fused_gateup,
         )
         cache = self._gemma4_flat_fused_gateup_use_cache
         if key not in cache:
@@ -16311,6 +16438,7 @@ class MegaGemmLlama(nn.Module):
                     lw.gate_up_bias,
                     norm_offset=False,
                     out=out,
+                    max_rows_override=max_rows_override,
                 )
                 self._flat_fp_linear(
                     self._gemma4_flat_rmsnorm(hidden, lw.pre_ff_norm_weight, self._flat_norm_eps, False),
@@ -16328,6 +16456,7 @@ class MegaGemmLlama(nn.Module):
                         lw.gate_up_bias,
                         norm_offset=False,
                         out=out,
+                        max_rows_override=max_rows_override,
                     ),
                     iters=8,
                 )
@@ -16340,12 +16469,14 @@ class MegaGemmLlama(nn.Module):
                     ),
                     iters=8,
                 )
-                if _GEMMA4_FORCE_FUSED_GATEUP_USE:
+                if force_fused_gateup:
                     use = True
                     _gemma4_log_mlp_fusion(
                         self,
                         "gateup",
-                        f"force-use enabled fused_ms={fused_ms:.3f} base_ms={base_ms:.3f}",
+                        "force-use enabled "
+                        f"source={'policy' if policy_force_fused_gateup else 'env'} "
+                        f"fused_ms={fused_ms:.3f} base_ms={base_ms:.3f}",
                     )
                 else:
                     use = bool(fused_ms <= (base_ms * (1.0 - _FUSED_RMSNORM_GATEUP_MIN_GAIN)))
@@ -16379,6 +16510,26 @@ class MegaGemmLlama(nn.Module):
             _gemma4_log_mlp_fusion(self, "deepfusion", "ineligible (requires CUDA inference mode)")
             return False
         rows = int(gate_up.shape[0]) if gate_up.dim() == 2 else int(gate_up.shape[0] * gate_up.shape[1])
+        policy_force_deepfusion = bool(
+            gate_up.dtype == torch.bfloat16
+            and rows
+            in getattr(self, "_gemma4_flat_policy_deepfusion_rows", ())
+        )
+        policy_cublas_down = bool(
+            gate_up.dtype == torch.bfloat16
+            and rows
+            in getattr(self, "_gemma4_flat_policy_cublas_down_rows", ())
+        )
+        if policy_cublas_down:
+            _gemma4_log_mlp_fusion(
+                self,
+                "deepfusion",
+                f"measured cuBLAS policy retained for BF16 rows={rows}",
+            )
+            return False
+        force_deepfusion = bool(
+            _GEMMA4_FORCE_DEEPFUSION_USE or policy_force_deepfusion
+        )
         i_dim = int(gate_up.shape[-1] // 2)
         h_dim = int(lw.down_weight.shape[0])
         tuned_a4b = _gemma4_a100_a4b_tuned_mlp_shape(
@@ -16388,7 +16539,7 @@ class MegaGemmLlama(nn.Module):
             gate_up.dtype,
             torch.cuda.get_device_name(gate_up.device),
         )
-        if tuned_a4b and not _GEMMA4_FORCE_DEEPFUSION_USE:
+        if tuned_a4b and not force_deepfusion:
             _gemma4_log_mlp_fusion(
                 self,
                 "deepfusion",
@@ -16396,7 +16547,7 @@ class MegaGemmLlama(nn.Module):
             )
             return False
         if (
-            not _GEMMA4_FORCE_DEEPFUSION_USE
+            not force_deepfusion
             and callable(deepfusion_mlp_prefers_triton_shape)
             and not deepfusion_mlp_prefers_triton_shape(i_dim, h_dim, rows)
         ):
@@ -16416,7 +16567,8 @@ class MegaGemmLlama(nn.Module):
             gate_up.device.type,
             gate_up.device.index,
             "gelu_tanh",
-            bool(_GEMMA4_FORCE_DEEPFUSION_USE),
+            force_deepfusion,
+            policy_force_deepfusion,
         )
         cache = self._gemma4_flat_deepfusion_use_cache
         if key not in cache:
@@ -16446,12 +16598,14 @@ class MegaGemmLlama(nn.Module):
                     lambda: self._gemma4_flat_baseline_down(gate_up, lw, layer_idx),
                     iters=8,
                 )
-                if _GEMMA4_FORCE_DEEPFUSION_USE:
+                if force_deepfusion:
                     use = True
                     _gemma4_log_mlp_fusion(
                         self,
                         "deepfusion",
-                        f"force-use enabled deep_ms={deep_ms:.3f} base_ms={base_ms:.3f}",
+                        "force-use enabled "
+                        f"source={'policy' if policy_force_deepfusion else 'env'} "
+                        f"deep_ms={deep_ms:.3f} base_ms={base_ms:.3f}",
                     )
                 else:
                     use = bool(deep_ms <= (base_ms * (1.0 - _DEEPFUSION_MLP_MIN_GAIN)))
@@ -16488,6 +16642,23 @@ class MegaGemmLlama(nn.Module):
         )
         if use_fused_gateup:
             try:
+                rows = (
+                    int(hidden.shape[0])
+                    if hidden.dim() == 2
+                    else int(hidden.shape[0] * hidden.shape[1])
+                )
+                force_fused_gateup = bool(
+                    _GEMMA4_FORCE_FUSED_GATEUP_USE
+                    or (
+                        hidden.dtype == torch.bfloat16
+                        and rows
+                        in getattr(
+                            self,
+                            "_gemma4_flat_policy_fused_gateup_rows",
+                            (),
+                        )
+                    )
+                )
                 gate_up = fused_rmsnorm_linear(
                     hidden,
                     lw.pre_ff_norm_weight,
@@ -16496,6 +16667,7 @@ class MegaGemmLlama(nn.Module):
                     lw.gate_up_bias,
                     norm_offset=False,
                     out=self._gemma4_flat_gate_up_bufs[layer_idx],
+                    max_rows_override=(rows if force_fused_gateup else None),
                 )
             except Exception as exc:
                 self._gemma4_flat_fused_gateup_use_cache.clear()
@@ -16613,6 +16785,12 @@ class MegaGemmLlama(nn.Module):
         pos_ids = pos_1d.reshape(bsz, 1)
         norm_eps = self._flat_norm_eps
         norm_offset = self._flat_norm_offset
+        paged_decode_splits = int(
+            getattr(self.runtime_policy, "paged_decode_splits", 0) or 0
+        )
+        paged_decode_gqa2_direct = bool(
+            getattr(self.runtime_policy, "paged_decode_gqa2_direct", False)
+        )
         int8_inline = getattr(self, '_flat_int8_inline', False)
         if int8_inline:
             int8_x_buf = self._flat_int8_x_buf
@@ -16625,8 +16803,7 @@ class MegaGemmLlama(nn.Module):
             and self._gemma4_flat_next_attn_norm_bufs is not None
         )
         dense_post_norm_chain = bool(
-            timing_events is None
-            and self._gemma4_flat_dense_post_norm_chain_enabled
+            self._gemma4_flat_dense_post_norm_chain_enabled
             and self._gemma4_flat_dense_next_attn_norm_bufs is not None
         )
 
@@ -16778,6 +16955,8 @@ class MegaGemmLlama(nn.Module):
                     norm_eps=norm_eps,
                     out=self._gemma4_flat_attn_bufs[layer_idx],
                     sliding_window=lw.sliding_window if lw.sliding_window > 0 else None,
+                    split_policy_override=paged_decode_splits or None,
+                    gqa2_direct_policy_enabled=paged_decode_gqa2_direct,
                 )
                 _timing_record_end(timing_events, "attn_core", attn_core_start_end)
                 if timing_events is not None and attn_core_start_end is not None and attn_core_start_end[0] is not None:
@@ -16832,6 +17011,7 @@ class MegaGemmLlama(nn.Module):
                     lw.scale,
                     out=self._gemma4_flat_attn_bufs[layer_idx],
                     sliding_window=lw.sliding_window if lw.sliding_window > 0 else None,
+                    split_policy_override=paged_decode_splits or None,
                 )
                 _timing_record_end(timing_events, "attn_core", attn_core_start_end)
                 if timing_events is not None and attn_core_start_end is not None and attn_core_start_end[0] is not None:
@@ -17241,6 +17421,9 @@ class MegaGemmLlama(nn.Module):
                 _timing_record_end(timing_events, "ple", ple_start_end)
 
             if dense_post_norm_chain and not lw.is_moe:
+                dense_post_norm_chain_start_end = _timing_record_start(
+                    timing_events is not None
+                )
                 write_next_dense_norm = layer_idx + 1 < len(
                     self._flat_layer_weights
                 )
@@ -17269,6 +17452,11 @@ class MegaGemmLlama(nn.Module):
                         if write_next_dense_norm
                         else None
                     ),
+                )
+                _timing_record_end(
+                    timing_events,
+                    "dense_post_norm_chain",
+                    dense_post_norm_chain_start_end,
                 )
                 self._gemma4_flat_dense_post_norm_chain_hits += 1
                 if write_next_dense_norm:
@@ -18665,6 +18853,7 @@ class MegaGemmLlama(nn.Module):
                     "mlp_act_ms",
                     "mlp_down_ms",
                     "mlp_output_norm_ms",
+                    "dense_post_norm_chain_ms",
                 )
                 mlp_total = sum(summary.get(key, 0.0) for key in mlp_keys)
                 if mlp_total > 0.0:
@@ -18763,6 +18952,9 @@ class MegaGemmLlama(nn.Module):
                 flat_swiglu_ms = summary.get("flat_swiglu_ms", 0.0)
                 flat_down_ms = summary.get("flat_down_ms", 0.0)
                 flat_moe_ms = summary.get("flat_moe_ms", 0.0)
+                dense_post_norm_chain_ms = summary.get(
+                    "dense_post_norm_chain_ms", 0.0
+                )
                 flat_residual_ms = summary.get("flat_residual_ms", 0.0)
                 moe_router_ms = summary.get("moe_router_ms", 0.0)
                 moe_experts_ms = summary.get("moe_experts_ms", 0.0)
@@ -18801,6 +18993,7 @@ class MegaGemmLlama(nn.Module):
                         f"flat={summary.get('flat_total_ms', 0.0):.1f}ms",
                         f"flat_parts(norm/qkv/rope_kv/attn/o/rnorm/gu/act/down/resid)={flat_norm_ms:.1f}/{flat_qkv_ms:.1f}/{flat_rope_kv_ms:.1f}/{flat_attn_core_ms:.1f}/{flat_o_ms:.1f}/{flat_resid_norm_ms:.1f}/{flat_gate_up_ms:.1f}/{flat_swiglu_ms:.1f}/{flat_down_ms:.1f}/{flat_residual_ms:.1f}ms",
                         f"flat_moe={flat_moe_ms:.1f}ms",
+                        f"dense_post_norm_chain={dense_post_norm_chain_ms:.1f}ms",
                         f"linear_attn={summary.get('linear_attn_ms', 0.0):.1f}ms",
                         f"linear_parts(proj/conv/gates/core/norm/o/fused_no)={linear_proj_ms:.1f}/{linear_conv_ms:.1f}/{linear_gates_ms:.1f}/{linear_core_ms:.1f}/{linear_norm_ms:.1f}/{linear_out_ms:.1f}/{linear_norm_out_ms:.1f}ms",
                         f"attn_other={summary.get('attn_unattributed_ms', 0.0):.1f}ms",

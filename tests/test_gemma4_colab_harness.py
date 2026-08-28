@@ -134,6 +134,59 @@ class Gemma4ColabHarnessTests(unittest.TestCase):
             self.script.index("== DOWNLOAD AND VERIFY ONCE FOR BOTH ENGINES =="),
         )
 
+    def test_gemma4_flat_decode_forwards_model_paged_attention_policy(self):
+        flat_decode = self.llama[
+            self.llama.index("    def _gemma4_flat_decode_layers(") :
+            self.llama.index("    def _flat_decode_layers(")
+        ]
+
+        self.assertIn(
+            'getattr(self.runtime_policy, "paged_decode_splits", 0)',
+            flat_decode,
+        )
+        self.assertIn(
+            'getattr(self.runtime_policy, "paged_decode_gqa2_direct", False)',
+            flat_decode,
+        )
+        self.assertIn(
+            "split_policy_override=paged_decode_splits or None",
+            flat_decode,
+        )
+        self.assertIn(
+            "gqa2_direct_policy_enabled=paged_decode_gqa2_direct",
+            flat_decode,
+        )
+
+    def test_dense_post_norm_chain_is_scoped_to_the_measured_e2b_policy(self):
+        setup = self.llama[
+            self.llama.index("dense_post_norm_chain_requested = policy_bool(") :
+            self.llama.index("self._gemma4_flat_dense_next_attn_norm_bufs = (")
+        ]
+
+        self.assertIn(
+            '"MEGAGEMM_GEMMA4_DENSE_POST_NORM_CHAIN_DECODE"',
+            setup,
+        )
+        self.assertIn('"gemma4_dense_post_norm_chain"', setup)
+        self.assertIn(
+            'self.runtime_policy.name == "gemma4-e2b-l4"',
+            setup,
+        )
+        self.assertNotIn('"gemma4-e4b-l4"', setup)
+
+    def test_dense_post_norm_chain_remains_active_under_decode_profiling(self):
+        flat_decode = self.llama[
+            self.llama.index("    def _gemma4_flat_decode_layers(") :
+            self.llama.index("    def _hybrid_flat_decode_layers(")
+        ]
+        selection = flat_decode[
+            flat_decode.index("dense_post_norm_chain = bool(") :
+            flat_decode.index("for layer_idx, lw in enumerate")
+        ]
+
+        self.assertNotIn("timing_events is None", selection)
+        self.assertIn('"dense_post_norm_chain"', flat_decode)
+
     def test_vllm_phase_split_requires_consistent_same_request_metrics(self):
         sys.path.insert(0, str(ROOT / "benchmarks"))
         from run_gemma4_moe_vs_vllm import validated_vllm_phase_span

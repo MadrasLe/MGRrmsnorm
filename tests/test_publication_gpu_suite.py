@@ -38,6 +38,8 @@ def test_fast_profile_is_scoped_and_model_specific(monkeypatch):
     runner = load_runner()
     monkeypatch.delenv("MEGAGEMM_DECODE_CUDA_GRAPHS", raising=False)
     monkeypatch.setenv("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    monkeypatch.setenv("MEGAGEMM_GEMMA4_FORCE_FUSED_GATEUP_USE", "1")
+    monkeypatch.setenv("MEGAGEMM_GEMMA4_FORCE_DEEPFUSION_USE", "1")
 
     e4b_env = runner.child_environment(
         runner.VARIANTS["megagemm-bf16"],
@@ -63,9 +65,13 @@ def test_fast_profile_is_scoped_and_model_specific(monkeypatch):
     assert e4b_env["MEGAGEMM_GEMMA4_FUSED_GATEUP_DECODE"] == "1"
     assert e4b_env["MEGAGEMM_GEMMA4_DEEPFUSION_MLP_DECODE"] == "1"
     assert "CUBLAS_WORKSPACE_CONFIG" not in e4b_env
+    assert "MEGAGEMM_GEMMA4_FORCE_FUSED_GATEUP_USE" not in e4b_env
+    assert "MEGAGEMM_GEMMA4_FORCE_DEEPFUSION_USE" not in e4b_env
     assert e2b_env["MEGAGEMM_DISABLE_CUDA_RMSNORM"] == "1"
     assert e2b_env["MEGAGEMM_DECODE_PREFER_STEP"] == "0"
     assert e2b_env["MEGAGEMM_REUSE_REQUEST_SCHEDULER"] == "0"
+    assert "MEGAGEMM_GEMMA4_FORCE_FUSED_GATEUP_USE" not in e2b_env
+    assert "MEGAGEMM_GEMMA4_FORCE_DEEPFUSION_USE" not in e2b_env
     assert "MEGAGEMM_DECODE_CUDA_GRAPHS" not in vllm_env
 
 
@@ -105,6 +111,7 @@ def test_fast_path_audit_proves_runtime_and_reports_selected_kernels(tmp_path):
             "gemma4_fused_qkv_prefill_hits": 3,
             "gemma4_fused_attn_prepare_hits": 2,
             "gemma4_batch_prefill_vectorized_kv_hits": 7,
+            "gemma4_e2b_l4_sliding_prefill_hits": 28,
             "gemma4_flat_fused_gateup_hits": 80,
             "gemma4_flat_deepfusion_hits": 70,
             "gemma4_fused_dual_ffn_norm_prefill_hits": 4,
@@ -143,6 +150,10 @@ def test_fast_path_audit_proves_runtime_and_reports_selected_kernels(tmp_path):
     assert report["selected_kernel_counters"]["gemma4_flat_fused_qkv_layers"] == 42
     assert report["selected_kernel_counters"]["gemma4_flat_fused_gateup"] == 80
     assert report["selected_kernel_counters"]["gemma4_flat_deepfusion"] == 70
+    assert (
+        report["selected_kernel_counters"]["gemma4_e2b_l4_sliding_prefill"]
+        == 28
+    )
     assert report["selected_kernel_counters"]["paged_attention_generic_direct"] == 100
     assert report["selected_lm_head"]["fused_rmsnorm_lm_head_argmax"] is True
 
@@ -218,6 +229,8 @@ def test_e2b_audit_rejects_structurally_valid_but_regressed_l4_path(tmp_path):
         "decode_runtime_stats": {
             "flat_decode_ready": True,
             "flat_decode_failed": False,
+            "gemma4_dense_post_norm_chain_decode_enabled": True,
+            "gemma4_dense_post_norm_chain_decode_hits": 63,
         },
         "scheduler_stats": {
             "decode_cuda_graphs": {
@@ -270,6 +283,8 @@ def test_e2b_audit_accepts_disabled_graph_stats_being_omitted(tmp_path):
         "decode_runtime_stats": {
             "flat_decode_ready": True,
             "flat_decode_failed": False,
+            "gemma4_dense_post_norm_chain_decode_enabled": True,
+            "gemma4_dense_post_norm_chain_decode_hits": 63,
         },
         "scheduler_stats": {
             "decode_execution": {
@@ -288,6 +303,146 @@ def test_e2b_audit_accepts_disabled_graph_stats_being_omitted(tmp_path):
     assert report["status"] == "passed"
     assert report["required"]["decode_cuda_graphs_disabled"] is True
     assert report["required"]["request_scheduler_reuse_count"] == 0
+    assert report["required"]["dense_post_norm_chain_required"] is True
+    assert report["required"]["dense_post_norm_chain_enabled"] is True
+    assert report["required"]["dense_post_norm_chain_hits"] == 63
+
+
+def test_e2b_audit_proves_batch8_cublas_mlp_policy_and_zero_fusion_hits(tmp_path):
+    runner = load_runner()
+    raw_path = tmp_path / "e2b_batch8.jsonl"
+    row = {
+        "ok": True,
+        "model": "google/gemma-4-E2B-it",
+        "hardware_label": "1xl4",
+        "dtype": "bf16",
+        "scenario": "batch",
+        "batch_size": 8,
+        "prompt_tokens_requested_per_request": 128,
+        "output_tps": 249.8,
+        "model_topology": {
+            "num_hidden_layers": 35,
+            "hidden_size": 1536,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 1,
+            "num_kv_shared_layers": 20,
+            "kv_cache_layers": 15,
+            "sliding_attention_layers": 28,
+            "full_attention_layers": 7,
+        },
+        "decode_runtime_stats": {
+            "flat_decode_ready": True,
+            "flat_decode_failed": False,
+            "gemma4_dense_post_norm_chain_decode_enabled": True,
+            "gemma4_dense_post_norm_chain_decode_hits": 63,
+            "gemma4_policy_bf16_fused_gateup_rows": [],
+            "gemma4_policy_bf16_deepfusion_rows": [],
+            "gemma4_policy_bf16_cublas_gateup_rows": [8],
+            "gemma4_policy_bf16_cublas_down_rows": [8],
+            "gemma4_flat_fused_gateup_hits": 0,
+            "gemma4_flat_deepfusion_hits": 0,
+        },
+        "scheduler_stats": {
+            "decode_execution": {
+                "prefer_step": False,
+                "decode_step_batches": 0,
+                "multi_step_batches": 128,
+            },
+        },
+    }
+    raw_path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+    report = runner.audit_gemma4_dense_fast_path(
+        raw_path, "gemma4-e2b-fast"
+    )
+
+    assert report["status"] == "passed"
+    assert report["required"]["batch8_cublas_mlp_applicable"] is True
+    assert report["required"]["batch8_cublas_gateup_policy_rows"] == [[8]]
+    assert report["required"]["batch8_cublas_down_policy_rows"] == [[8]]
+    assert report["required"]["batch8_fused_gateup_hits"] == 0
+    assert report["required"]["batch8_deepfusion_hits"] == 0
+
+    row["decode_runtime_stats"]["gemma4_flat_deepfusion_hits"] = 1
+    raw_path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    rejected = runner.audit_gemma4_dense_fast_path(
+        raw_path, "gemma4-e2b-fast"
+    )
+    assert rejected["status"] == "failed"
+    assert any(
+        "batch-8 deepfusion path unexpectedly ran" in error
+        for error in rejected["errors"]
+    )
+
+
+def test_e2b_audit_requires_promoted_l4_long_sliding_prefill_hits(tmp_path):
+    runner = load_runner()
+    raw_path = tmp_path / "e2b_long_batch8.jsonl"
+    row = {
+        "ok": True,
+        "model": "google/gemma-4-E2B-it",
+        "hardware_label": "1xl4",
+        "dtype": "bf16",
+        "scenario": "long_context",
+        "batch_size": 8,
+        "prompt_tokens_requested_per_request": 2048,
+        "output_tps": 130.48,
+        "model_topology": {
+            "num_hidden_layers": 35,
+            "hidden_size": 1536,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 1,
+            "num_kv_shared_layers": 20,
+            "kv_cache_layers": 15,
+            "sliding_attention_layers": 28,
+            "full_attention_layers": 7,
+        },
+        "decode_runtime_stats": {
+            "flat_decode_ready": True,
+            "flat_decode_failed": False,
+            "gemma4_dense_post_norm_chain_decode_enabled": True,
+            "gemma4_dense_post_norm_chain_decode_hits": 35560,
+            "gemma4_policy_bf16_fused_gateup_rows": [],
+            "gemma4_policy_bf16_deepfusion_rows": [],
+            "gemma4_policy_bf16_cublas_gateup_rows": [8],
+            "gemma4_policy_bf16_cublas_down_rows": [8],
+            "gemma4_flat_fused_gateup_hits": 0,
+            "gemma4_flat_deepfusion_hits": 0,
+            "gemma4_e2b_l4_sliding_prefill_enabled": True,
+            "gemma4_e2b_l4_sliding_prefill_hits": 224,
+        },
+        "scheduler_stats": {
+            "decode_execution": {
+                "prefer_step": False,
+                "decode_step_batches": 0,
+                "multi_step_batches": 128,
+            },
+        },
+    }
+    raw_path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+    report = runner.audit_gemma4_dense_fast_path(
+        raw_path, "gemma4-e2b-fast"
+    )
+
+    assert report["status"] == "passed"
+    assert report["required"]["e2b_l4_sliding_prefill_applicable"] is True
+    assert report["required"]["e2b_l4_sliding_prefill_enabled"] is True
+    assert report["required"]["e2b_l4_sliding_prefill_hits"] == 224
+    assert report["performance_gate"]["floors"][
+        "long_context/b8/p2048"
+    ] == 115.0
+
+    row["decode_runtime_stats"]["gemma4_e2b_l4_sliding_prefill_hits"] = 0
+    raw_path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    rejected = runner.audit_gemma4_dense_fast_path(
+        raw_path, "gemma4-e2b-fast"
+    )
+    assert rejected["status"] == "failed"
+    assert any(
+        "sliding-prefill Triton kernel was never exercised" in error
+        for error in rejected["errors"]
+    )
 
 
 def test_resume_rejects_a_summary_from_a_different_workload(tmp_path):

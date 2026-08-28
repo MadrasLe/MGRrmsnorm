@@ -103,6 +103,9 @@ GEMMA4_PROFILE_REQUIREMENTS = {
         "model_marker": "e2b",
         "prefer_step": False,
         "reuse_scheduler": False,
+        "require_dense_post_norm_chain": True,
+        "require_bf16_batch8_cublas_mlp": True,
+        "require_e2b_l4_sliding_prefill": True,
         "topology": {
             "num_hidden_layers": 35,
             "hidden_size": 1536,
@@ -114,19 +117,22 @@ GEMMA4_PROFILE_REQUIREMENTS = {
             "full_attention_layers": 7,
         },
         # Conservative regression floors derived from the validated L4/BF16
-        # publication run (about 28/211/25/110 tok/s).  They are deliberately
-        # low enough for run-to-run variance but reject the broken 4/27 path.
+        # paths. The long B8 floor includes the promoted sliding-prefill Triton
+        # result (130.48 tok/s) with enough margin for run-to-run variance.
         "l4_bf16_floors": {
             ("single", 1, 128): 15.0,
             ("batch", 8, 128): 120.0,
             ("long_context", 1, 2048): 14.0,
-            ("long_context", 8, 2048): 65.0,
+            ("long_context", 8, 2048): 115.0,
         },
     },
     "gemma4-e4b-fast": {
         "model_marker": "e4b",
         "prefer_step": True,
         "reuse_scheduler": True,
+        "require_dense_post_norm_chain": False,
+        "require_bf16_batch8_cublas_mlp": False,
+        "require_e2b_l4_sliding_prefill": False,
         "topology": {
             "num_hidden_layers": 42,
             "hidden_size": 2560,
@@ -179,6 +185,10 @@ def child_environment(
             # Deterministic cuBLAS workspaces were copied from a separate A100
             # validation harness and are not part of the dense L4 speed path.
             env.pop("CUBLAS_WORKSPACE_CONFIG", None)
+            # Publication profiles must exercise the measured model policy,
+            # not force flags inherited from an earlier notebook experiment.
+            env.pop("MEGAGEMM_GEMMA4_FORCE_FUSED_GATEUP_USE", None)
+            env.pop("MEGAGEMM_GEMMA4_FORCE_DEEPFUSION_USE", None)
         env.update(profile_environment(profile, model))
     return env
 
@@ -536,9 +546,13 @@ def audit_gemma4_dense_fast_path(path: Path, profile: str) -> dict:
     if not expected_reuse and request_scheduler_reuse_count > 0:
         errors.append("E2B unexpectedly reused the E4B request scheduler path")
 
-    dense_tail_requested = os.environ.get(
+    dense_tail_env_requested = os.environ.get(
         "MEGAGEMM_GEMMA4_DENSE_POST_NORM_CHAIN_DECODE", "0"
     ).strip().lower() in {"1", "true", "yes", "on"}
+    dense_tail_required = bool(
+        requirement.get("require_dense_post_norm_chain", False)
+    )
+    dense_tail_requested = dense_tail_required or dense_tail_env_requested
     dense_tail_enabled = bool(
         decode_stats
         and all(
@@ -553,6 +567,129 @@ def audit_gemma4_dense_fast_path(path: Path, profile: str) -> dict:
         errors.append("requested Gemma 4 dense post-norm chain was not enabled")
     if dense_tail_requested and dense_tail_hits <= 0:
         errors.append("requested Gemma 4 dense post-norm chain was never exercised")
+
+    require_batch8_cublas_mlp = bool(
+        requirement.get("require_bf16_batch8_cublas_mlp", False)
+    )
+    batch8_rows = [
+        row
+        for row in successful
+        if int(row.get("batch_size", 0) or 0) == 8
+        and str(row.get("dtype") or "").lower() == "bf16"
+        and "l4" in str(row.get("hardware_label") or "").lower()
+        and isinstance(row.get("decode_runtime_stats"), dict)
+    ]
+    batch8_decode_stats = [row["decode_runtime_stats"] for row in batch8_rows]
+    fused_gateup_policy_rows = sorted(
+        {
+            tuple(int(value) for value in stats.get(
+                "gemma4_policy_bf16_fused_gateup_rows", []
+            ))
+            for stats in batch8_decode_stats
+            if stats.get("gemma4_policy_bf16_fused_gateup_rows", [])
+        }
+    )
+    deepfusion_policy_rows = sorted(
+        {
+            tuple(int(value) for value in stats.get(
+                "gemma4_policy_bf16_deepfusion_rows", []
+            ))
+            for stats in batch8_decode_stats
+            if stats.get("gemma4_policy_bf16_deepfusion_rows", [])
+        }
+    )
+    cublas_gateup_policy_rows = sorted(
+        {
+            tuple(int(value) for value in stats.get(
+                "gemma4_policy_bf16_cublas_gateup_rows", []
+            ))
+            for stats in batch8_decode_stats
+        }
+    )
+    cublas_down_policy_rows = sorted(
+        {
+            tuple(int(value) for value in stats.get(
+                "gemma4_policy_bf16_cublas_down_rows", []
+            ))
+            for stats in batch8_decode_stats
+        }
+    )
+    batch8_fused_gateup_hits = _max_counter(
+        batch8_decode_stats, "gemma4_flat_fused_gateup_hits"
+    )
+    batch8_deepfusion_hits = _max_counter(
+        batch8_decode_stats, "gemma4_flat_deepfusion_hits"
+    )
+    batch8_cublas_mlp_applicable = bool(
+        require_batch8_cublas_mlp and batch8_rows
+    )
+    if batch8_cublas_mlp_applicable:
+        if cublas_gateup_policy_rows != [(8,)]:
+            errors.append(
+                "E2B L4 BF16 cuBLAS gate-up policy rows do not equal [8]: "
+                f"{cublas_gateup_policy_rows!r}"
+            )
+        if cublas_down_policy_rows != [(8,)]:
+            errors.append(
+                "E2B L4 BF16 cuBLAS down policy rows do not equal [8]: "
+                f"{cublas_down_policy_rows!r}"
+            )
+        if fused_gateup_policy_rows:
+            errors.append(
+                "E2B L4 BF16 batch-8 still promotes fused gate-up rows: "
+                f"{fused_gateup_policy_rows!r}"
+            )
+        if deepfusion_policy_rows:
+            errors.append(
+                "E2B L4 BF16 batch-8 still promotes deepfusion rows: "
+                f"{deepfusion_policy_rows!r}"
+            )
+        if batch8_fused_gateup_hits > 0:
+            errors.append(
+                "E2B L4 BF16 batch-8 fused gate-up path unexpectedly ran"
+            )
+        if batch8_deepfusion_hits > 0:
+            errors.append(
+                "E2B L4 BF16 batch-8 deepfusion path unexpectedly ran"
+            )
+
+    require_e2b_l4_sliding_prefill = bool(
+        requirement.get("require_e2b_l4_sliding_prefill", False)
+    )
+    e2b_l4_long_rows = [
+        row
+        for row in successful
+        if str(row.get("scenario") or "") == "long_context"
+        and int(row.get("batch_size", 0) or 0) == 8
+        and int(row.get("prompt_tokens_requested_per_request", 0) or 0) >= 2048
+        and str(row.get("dtype") or "").lower() == "bf16"
+        and "l4" in str(row.get("hardware_label") or "").lower()
+        and isinstance(row.get("decode_runtime_stats"), dict)
+    ]
+    e2b_l4_long_stats = [row["decode_runtime_stats"] for row in e2b_l4_long_rows]
+    e2b_l4_sliding_prefill_applicable = bool(
+        require_e2b_l4_sliding_prefill and e2b_l4_long_rows
+    )
+    e2b_l4_sliding_prefill_enabled = bool(
+        e2b_l4_long_stats
+        and all(
+            stats.get("gemma4_e2b_l4_sliding_prefill_enabled")
+            for stats in e2b_l4_long_stats
+        )
+    )
+    e2b_l4_sliding_prefill_hits = _max_counter(
+        e2b_l4_long_stats,
+        "gemma4_e2b_l4_sliding_prefill_hits",
+    )
+    if e2b_l4_sliding_prefill_applicable:
+        if not e2b_l4_sliding_prefill_enabled:
+            errors.append(
+                "E2B L4 BF16 long sliding-prefill policy was not enabled"
+            )
+        if e2b_l4_sliding_prefill_hits <= 0:
+            errors.append(
+                "E2B L4 BF16 long sliding-prefill Triton kernel was never exercised"
+            )
 
     performance_gate = {
         "applicable": False,
@@ -621,6 +758,31 @@ def audit_gemma4_dense_fast_path(path: Path, profile: str) -> dict:
             "decode_cuda_graph_failures": graph_failures,
             "request_scheduler_reuse_expected": expected_reuse,
             "request_scheduler_reuse_count": request_scheduler_reuse_count,
+            "dense_post_norm_chain_required": dense_tail_required,
+            "dense_post_norm_chain_enabled": dense_tail_enabled,
+            "dense_post_norm_chain_hits": dense_tail_hits,
+            "batch8_cublas_mlp_required": require_batch8_cublas_mlp,
+            "batch8_cublas_mlp_applicable": batch8_cublas_mlp_applicable,
+            "batch8_fused_gateup_policy_rows": [
+                list(rows) for rows in fused_gateup_policy_rows
+            ],
+            "batch8_deepfusion_policy_rows": [
+                list(rows) for rows in deepfusion_policy_rows
+            ],
+            "batch8_cublas_gateup_policy_rows": [
+                list(rows) for rows in cublas_gateup_policy_rows
+            ],
+            "batch8_cublas_down_policy_rows": [
+                list(rows) for rows in cublas_down_policy_rows
+            ],
+            "batch8_fused_gateup_hits": batch8_fused_gateup_hits,
+            "batch8_deepfusion_hits": batch8_deepfusion_hits,
+            "e2b_l4_sliding_prefill_required": require_e2b_l4_sliding_prefill,
+            "e2b_l4_sliding_prefill_applicable": (
+                e2b_l4_sliding_prefill_applicable
+            ),
+            "e2b_l4_sliding_prefill_enabled": e2b_l4_sliding_prefill_enabled,
+            "e2b_l4_sliding_prefill_hits": e2b_l4_sliding_prefill_hits,
         },
         "expected_topology": expected_topology,
         "observed_topology": topology_stats[0] if topology_stats else None,
@@ -642,6 +804,9 @@ def audit_gemma4_dense_fast_path(path: Path, profile: str) -> dict:
             ),
             "gemma4_vectorized_prefill_kv": _max_counter(
                 decode_stats, "gemma4_batch_prefill_vectorized_kv_hits"
+            ),
+            "gemma4_e2b_l4_sliding_prefill": _max_counter(
+                decode_stats, "gemma4_e2b_l4_sliding_prefill_hits"
             ),
             "gemma4_flat_fused_gateup": _max_counter(
                 decode_stats, "gemma4_flat_fused_gateup_hits"

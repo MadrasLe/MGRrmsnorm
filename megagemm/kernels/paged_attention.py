@@ -22,6 +22,7 @@ __all__ = ['paged_attention_decode', 'prefill_attention', 'PackedAttentionMetada
            'packed_prefill_attention', 'fused_rope_kv_write',
            'gemma4_long_sliding_prefill_attention',
            'gemma4_long_full_prefill_attention',
+           'gemma4_e2b_l4_sliding_prefill_attention',
            'paged_kv_cache_scatter',
            'paged_kv_cache_scatter_token_tiled',
            '_triton_paged_decode_fused',
@@ -62,6 +63,10 @@ _GEMMA4_LONG_SLIDING_PREFILL_LOGGED = False
 _GEMMA4_LONG_FULL_PREFILL_DISABLED = False
 _GEMMA4_LONG_FULL_PREFILL_FAILURE = ""
 _GEMMA4_LONG_FULL_PREFILL_LOGGED = False
+_GEMMA4_E2B_L4_SLIDING_PREFILL_DISABLED = False
+_GEMMA4_E2B_L4_SLIDING_PREFILL_FAILURE = ""
+_GEMMA4_E2B_L4_SLIDING_PREFILL_LOGGED = False
+_GEMMA4_E2B_L4_SLIDING_PREFILL_HITS = 0
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -373,10 +378,17 @@ def _use_gqa2_direct_decode(
     num_kv_heads: int,
     head_dim: int,
     num_splits: int,
+    policy_enabled: Optional[bool] = None,
 ) -> bool:
     if _GQA2_DECODE_DISABLED:
         return False
-    if not _env_bool("MEGAGEMM_PAGED_DECODE_GQA2", False):
+    env_value = os.environ.get("MEGAGEMM_PAGED_DECODE_GQA2", "").strip()
+    enabled = (
+        _env_bool("MEGAGEMM_PAGED_DECODE_GQA2", False)
+        if env_value
+        else bool(policy_enabled)
+    )
+    if not enabled:
         return False
     if num_splits != 1 or num_kv_heads <= 0:
         return False
@@ -668,6 +680,7 @@ def _get_decode_split_count(
     *,
     num_warps: int = 4,
     device: Optional[torch.device] = None,
+    policy_override: Optional[int] = None,
 ) -> int:
     """Auto-tune paged decode split parallelism for long-context decode.
 
@@ -687,6 +700,9 @@ def _get_decode_split_count(
         except ValueError:
             value = 1
         return max(1, min(value, max_blocks))
+
+    if policy_override is not None and int(policy_override) > 0:
+        return max(1, min(int(policy_override), max_blocks))
 
     base_programs = max(1, num_seqs * num_q_heads)
     _, device_name, sm_count = _cuda_device_info(device)
@@ -3091,6 +3107,7 @@ def _triton_paged_decode(
     out=None,
     sliding_window: Optional[int] = None,
     max_blocks_override: Optional[int] = None,
+    split_policy_override: Optional[int] = None,
 ):
     """Triton implementation of paged attention decode."""
     num_seqs, num_q_heads, head_dim = query.shape
@@ -3107,6 +3124,7 @@ def _triton_paged_decode(
         loop_max_blocks,
         num_warps=num_warps,
         device=query.device,
+        policy_override=split_policy_override,
     )
     num_warps = _decode_num_warps(head_dim, query.device, num_splits=num_splits)
     reduce_warps = _decode_reduce_num_warps(head_dim, num_splits)
@@ -3479,7 +3497,9 @@ def _triton_paged_decode_fused(query, kv_cache, block_tables, seq_lens, scale,
                                 cos, sin, positions, half_rotate=False,
                                 rotary_dim=None, q_norm_weight=None, norm_eps=1e-6,
                                 out=None, sliding_window: Optional[int] = None,
-                                max_blocks_override: Optional[int] = None):
+                                max_blocks_override: Optional[int] = None,
+                                split_policy_override: Optional[int] = None,
+                                gqa2_direct_policy_enabled: Optional[bool] = None):
     """Triton fused QK-Norm + RoPE + paged attention decode."""
     num_seqs, num_q_heads, head_dim = query.shape
     num_kv_heads = kv_cache.shape[2]
@@ -3563,6 +3583,7 @@ def _triton_paged_decode_fused(query, kv_cache, block_tables, seq_lens, scale,
         loop_max_blocks,
         num_warps=num_warps,
         device=query.device,
+        policy_override=split_policy_override,
     )
     num_warps = _decode_num_warps(head_dim, query.device, num_splits=num_splits)
     reduce_warps = _decode_reduce_num_warps(head_dim, num_splits)
@@ -3632,6 +3653,7 @@ def _triton_paged_decode_fused(query, kv_cache, block_tables, seq_lens, scale,
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
             num_splits=num_splits,
+            policy_enabled=gqa2_direct_policy_enabled,
         ):
             try:
                 grid_gqa2 = (num_seqs, triton.cdiv(num_q_heads, 2))
@@ -4059,6 +4081,7 @@ def paged_attention_decode(
     scale: Optional[float] = None,
     out: Optional[torch.Tensor] = None,
     sliding_window: Optional[int] = None,
+    split_policy_override: Optional[int] = None,
 ) -> torch.Tensor:
     """
     Paged attention for decode step (1 token per sequence).
@@ -4073,6 +4096,8 @@ def paged_attention_decode(
         out: Optional pre-allocated output buffer [num_seqs, num_q_heads, head_dim]
         sliding_window: Optional local decode window. When set, only the most
             recent tokens participate in attention.
+        split_policy_override: Optional model/hardware policy. An explicit
+            ``MEGAGEMM_PAGED_DECODE_SPLITS`` value still takes precedence.
 
     Returns:
         output: [num_seqs, num_q_heads, head_dim]
@@ -4090,6 +4115,7 @@ def paged_attention_decode(
             scale,
             out=out,
             sliding_window=sliding_window,
+            split_policy_override=split_policy_override,
         )
     else:
         return _pytorch_paged_decode(
@@ -4225,6 +4251,302 @@ if _HAS_TRITON:
             acc.to(output_ptr.dtype.element_ty),
             mask=m_mask[:, None],
         )
+
+
+    @triton.jit
+    def _gemma4_e2b_l4_sliding_prefill_kernel(
+        output_ptr,
+        q_ptr,
+        k_ptr,
+        v_ptr,
+        scale,
+        stride_qb,
+        stride_qh,
+        stride_qs,
+        stride_qd,
+        stride_kb,
+        stride_ks,
+        stride_kd,
+        stride_vb,
+        stride_vs,
+        stride_vd,
+        stride_ob,
+        stride_oh,
+        stride_os,
+        stride_od,
+        NUM_Q_TILES: tl.constexpr,
+        SEQ_LEN: tl.constexpr,
+        SLIDING_WINDOW: tl.constexpr,
+        MAX_WINDOW_TILES: tl.constexpr,
+        GROUP_HEADS: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_ROWS: tl.constexpr,
+        HEAD_DIM: tl.constexpr,
+    ):
+        """Gemma 4 E2B/L4 sliding attention with KV1 head reuse.
+
+        A program owns ``GROUP_HEADS`` query heads over one temporal query
+        tile.  Flattening those heads into ``BLOCK_ROWS`` keeps the tensor-core
+        M dimension useful while reducing causal-boundary waste compared with
+        one large temporal tile.  K/V are loaded once for the whole head group.
+        """
+        pid_seq_tile = tl.program_id(0)
+        head_group_idx = tl.program_id(1)
+        batch_idx = pid_seq_tile // NUM_Q_TILES
+        q_tile_idx = pid_seq_tile % NUM_Q_TILES
+
+        row_offsets = tl.arange(0, BLOCK_ROWS)
+        head_lanes = row_offsets // BLOCK_M
+        token_lanes = row_offsets - head_lanes * BLOCK_M
+        q_head_offsets = head_group_idx * GROUP_HEADS + head_lanes
+
+        m_start = q_tile_idx * BLOCK_M
+        m_offsets = m_start + token_lanes
+        m_mask = m_offsets < SEQ_LEN
+        d_offsets = tl.arange(0, HEAD_DIM)
+
+        q_ptrs = (
+            q_ptr
+            + batch_idx * stride_qb
+            + q_head_offsets[:, None] * stride_qh
+            + m_offsets[:, None] * stride_qs
+            + d_offsets[None, :] * stride_qd
+        )
+        q = tl.load(q_ptrs, mask=m_mask[:, None], other=0.0)
+
+        m_prev = tl.full([BLOCK_ROWS], value=-1.0e20, dtype=tl.float32)
+        l_prev = tl.zeros([BLOCK_ROWS], dtype=tl.float32)
+        acc = tl.zeros([BLOCK_ROWS, HEAD_DIM], dtype=tl.float32)
+
+        first_key = tl.maximum(0, m_start - SLIDING_WINDOW + 1)
+        first_k_tile = first_key // BLOCK_N
+        n_lane = tl.arange(0, BLOCK_N)
+
+        for tile_offset in range(MAX_WINDOW_TILES):
+            n_offsets = (first_k_tile + tile_offset) * BLOCK_N + n_lane
+            n_mask = n_offsets < SEQ_LEN
+
+            # E2B has exactly one KV head, so every query head in the program
+            # consumes the same K/V tile.
+            k_ptrs = (
+                k_ptr
+                + batch_idx * stride_kb
+                + d_offsets[:, None] * stride_kd
+                + n_offsets[None, :] * stride_ks
+            )
+            k = tl.load(k_ptrs, mask=n_mask[None, :], other=0.0)
+            scores = tl.dot(q, k, out_dtype=tl.float32) * scale
+
+            valid = (
+                m_mask[:, None]
+                & n_mask[None, :]
+                & (n_offsets[None, :] <= m_offsets[:, None])
+                & (
+                    n_offsets[None, :]
+                    >= (m_offsets[:, None] - SLIDING_WINDOW + 1)
+                )
+            )
+            scores = tl.where(valid, scores, -1.0e20)
+
+            m_cur = tl.max(scores, axis=1)
+            m_new = tl.maximum(m_prev, m_cur)
+            alpha = tl.exp(m_prev - m_new)
+            probs = tl.exp(scores - m_new[:, None])
+            probs = tl.where(valid, probs, 0.0)
+            l_cur = tl.sum(probs, axis=1)
+
+            v_ptrs = (
+                v_ptr
+                + batch_idx * stride_vb
+                + n_offsets[:, None] * stride_vs
+                + d_offsets[None, :] * stride_vd
+            )
+            v = tl.load(v_ptrs, mask=n_mask[:, None], other=0.0)
+            acc = acc * alpha[:, None] + tl.dot(
+                probs.to(v.dtype),
+                v,
+                out_dtype=tl.float32,
+            )
+            l_prev = l_prev * alpha + l_cur
+            m_prev = m_new
+
+        acc = tl.where(l_prev[:, None] > 0, acc / l_prev[:, None], 0.0)
+        out_ptrs = (
+            output_ptr
+            + batch_idx * stride_ob
+            + q_head_offsets[:, None] * stride_oh
+            + m_offsets[:, None] * stride_os
+            + d_offsets[None, :] * stride_od
+        )
+        tl.store(
+            out_ptrs,
+            acc.to(output_ptr.dtype.element_ty),
+            mask=m_mask[:, None],
+        )
+
+
+def gemma4_e2b_l4_sliding_prefill_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    sliding_window: int,
+    scale: Optional[float] = None,
+    group_heads: Optional[int] = None,
+    block_m: Optional[int] = None,
+    block_n: Optional[int] = None,
+    num_warps: Optional[int] = None,
+    num_stages: Optional[int] = None,
+    force: bool = False,
+) -> Optional[torch.Tensor]:
+    """Experimental exact-shape kernel for Gemma 4 E2B on NVIDIA L4.
+
+    This path is deliberately narrower than the older A100/A4B long-prefill
+    kernels: BF16, B8, Q8/KV1, S2048..2304, H256, W512, and L4 only.  The
+    bounded sequence range includes the chat-template tokens added to the
+    publication workload. Runtime use is controlled by the model-level
+    experiment flag; ``force`` exists solely for the isolated tuning harness.
+    """
+    global _GEMMA4_E2B_L4_SLIDING_PREFILL_DISABLED
+    global _GEMMA4_E2B_L4_SLIDING_PREFILL_FAILURE
+    global _GEMMA4_E2B_L4_SLIDING_PREFILL_LOGGED
+    global _GEMMA4_E2B_L4_SLIDING_PREFILL_HITS
+
+    if _GEMMA4_E2B_L4_SLIDING_PREFILL_DISABLED and not force:
+        return None
+    if not (_HAS_TRITON and q.is_cuda and k.is_cuda and v.is_cuda):
+        return None
+    if q.device != k.device or q.device != v.device:
+        return None
+    if q.dtype != torch.bfloat16 or k.dtype != q.dtype or v.dtype != q.dtype:
+        return None
+    if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
+        return None
+
+    batch_size, num_q_heads, seq_len, head_dim = q.shape
+    if tuple(k.shape) != (8, 1, seq_len, 256):
+        return None
+    if tuple(v.shape) != tuple(k.shape):
+        return None
+    if (
+        batch_size != 8
+        or num_q_heads != 8
+        or seq_len < 2048
+        or seq_len > 2304
+        or head_dim != 256
+        or int(sliding_window) != 512
+    ):
+        return None
+
+    _, device_name, _ = _cuda_device_info(q.device)
+    if "l4" not in _device_name_tokens(device_name):
+        return None
+
+    group_heads = int(
+        group_heads
+        if group_heads is not None
+        else _env_int("MEGAGEMM_GEMMA4_E2B_L4_SLIDING_GROUP_HEADS", 4)
+    )
+    block_m = int(
+        block_m
+        if block_m is not None
+        else _env_int("MEGAGEMM_GEMMA4_E2B_L4_SLIDING_BLOCK_M", 8)
+    )
+    block_n = int(
+        block_n
+        if block_n is not None
+        else _env_int("MEGAGEMM_GEMMA4_E2B_L4_SLIDING_BLOCK_N", 64)
+    )
+    num_warps = int(
+        num_warps
+        if num_warps is not None
+        else _env_int("MEGAGEMM_GEMMA4_E2B_L4_SLIDING_NUM_WARPS", 4)
+    )
+    num_stages = int(
+        num_stages
+        if num_stages is not None
+        else _env_int("MEGAGEMM_GEMMA4_E2B_L4_SLIDING_NUM_STAGES", 2)
+    )
+    block_rows = int(group_heads * block_m)
+    if (
+        group_heads not in (1, 2, 4, 8)
+        or num_q_heads % group_heads != 0
+        or block_m not in (4, 8, 16, 32)
+        or block_n not in (32, 64, 128)
+        or block_rows not in (16, 32, 64)
+        or num_warps not in (4, 8)
+        or num_stages not in (2, 3)
+    ):
+        return None
+
+    num_q_tiles = triton.cdiv(seq_len, block_m)
+    max_window_tiles = triton.cdiv(
+        int(sliding_window) + block_m + block_n - 2,
+        block_n,
+    )
+    output = torch.empty_like(q)
+    if scale is None:
+        scale = 1.0 / math.sqrt(head_dim)
+    grid = (batch_size * num_q_tiles, num_q_heads // group_heads)
+
+    try:
+        _gemma4_e2b_l4_sliding_prefill_kernel[grid](
+            output,
+            q,
+            k,
+            v,
+            float(scale),
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            q.stride(3),
+            k.stride(0),
+            k.stride(2),
+            k.stride(3),
+            v.stride(0),
+            v.stride(2),
+            v.stride(3),
+            output.stride(0),
+            output.stride(1),
+            output.stride(2),
+            output.stride(3),
+            NUM_Q_TILES=num_q_tiles,
+            SEQ_LEN=seq_len,
+            SLIDING_WINDOW=int(sliding_window),
+            MAX_WINDOW_TILES=max_window_tiles,
+            GROUP_HEADS=group_heads,
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            BLOCK_ROWS=block_rows,
+            HEAD_DIM=head_dim,
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+    except Exception as exc:
+        _GEMMA4_E2B_L4_SLIDING_PREFILL_FAILURE = (
+            f"{type(exc).__name__}: {exc}"
+        )
+        if not force:
+            _GEMMA4_E2B_L4_SLIDING_PREFILL_DISABLED = True
+        if not _GEMMA4_E2B_L4_SLIDING_PREFILL_LOGGED:
+            _GEMMA4_E2B_L4_SLIDING_PREFILL_LOGGED = True
+            print(
+                "[MegaGemm] Gemma4 E2B/L4 sliding prefill kernel failed; "
+                "falling back to SDPA "
+                f"({_GEMMA4_E2B_L4_SLIDING_PREFILL_FAILURE})"
+            )
+        return None
+
+    _GEMMA4_E2B_L4_SLIDING_PREFILL_HITS += 1
+    if not _GEMMA4_E2B_L4_SLIDING_PREFILL_LOGGED:
+        _GEMMA4_E2B_L4_SLIDING_PREFILL_LOGGED = True
+        print(
+            "[MegaGemm] Gemma4 E2B/L4 sliding prefill active: "
+            f"B8 S{seq_len} Q8/KV1 H256 W512 group_heads={group_heads} "
+            f"block_m={block_m} block_n={block_n} warps={num_warps}"
+        )
+    return output
 
 
 def gemma4_long_sliding_prefill_attention(
