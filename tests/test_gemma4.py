@@ -1911,6 +1911,44 @@ def test_gemma4_a4b_decode_graph_policy_is_exact():
     )
 
 
+def test_gemma4_e2b_l4_native_decode_graph_policy_is_exact():
+    from megagemm.models.llama import _gemma4_l4_e2b_decode_graph_shape
+
+    class Config:
+        model_type = "gemma4_text"
+        enable_moe_block = False
+        hidden_size = 1536
+        num_hidden_layers = 35
+        num_attention_heads = 8
+        num_key_value_heads = 1
+        num_kv_shared_layers = 20
+        layer_types = [
+            "full_attention"
+            if layer_idx in {0, 6, 12, 18, 24, 30, 34}
+            else "sliding_attention"
+            for layer_idx in range(35)
+        ]
+
+    kwargs = {
+        "num_seqs": 8,
+        "dtype": torch.bfloat16,
+        "device_type": "cuda",
+        "device_name": "NVIDIA L4",
+    }
+    assert Config.layer_types.count("sliding_attention") == 28
+    assert Config.layer_types.count("full_attention") == 7
+    assert _gemma4_l4_e2b_decode_graph_shape(Config(), **kwargs)
+    assert not _gemma4_l4_e2b_decode_graph_shape(
+        Config(), **{**kwargs, "num_seqs": 1}
+    )
+    assert not _gemma4_l4_e2b_decode_graph_shape(
+        Config(), **{**kwargs, "dtype": torch.float16}
+    )
+    assert not _gemma4_l4_e2b_decode_graph_shape(
+        Config(), **{**kwargs, "device_name": "NVIDIA A100-SXM4-80GB"}
+    )
+
+
 def test_gemma4_batch_prefill_selects_native_padded_path():
     from megagemm.engine.scheduler import Scheduler
 

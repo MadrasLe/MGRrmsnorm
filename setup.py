@@ -135,7 +135,9 @@ else:
 try:
     from torch.utils.cpp_extension import BuildExtension, CppExtension, CUDAExtension
 
-    # CPU C++ decode-loop helper (reduces Python loop/kwargs overhead in decode hot path)
+    # C++ decode orchestration: full-attention helpers plus native CUDA-graph
+    # burst replay.  This remains a CppExtension because graph execution is
+    # provided by the torch CUDAGraph binding; no project CUDA source is needed.
     if not _force_skip_native:
         ext_modules.append(
             CppExtension(

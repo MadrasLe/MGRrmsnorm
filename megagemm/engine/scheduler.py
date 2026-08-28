@@ -24,6 +24,11 @@ from .kv_cache import BlockManager
 from .sampling import sample_logits
 from ..models.runtime_policy import policy_bool
 
+try:
+    import megagemm_decode_ops as _decode_native_ops
+except ImportError:
+    _decode_native_ops = None
+
 __all__ = ['Request', 'RequestStatus', 'Scheduler']
 
 
@@ -257,6 +262,11 @@ class Scheduler:
             "MEGAGEMM_DECODE_GRAPH_PERSISTENT_TOKEN_FEEDBACK",
             default=False,
         )
+        self._decode_native_graph_burst = bool(
+            _env_bool("MEGAGEMM_NATIVE_DECODE_GRAPH_BURST", default=False)
+            and _decode_native_ops is not None
+            and hasattr(_decode_native_ops, "run_cuda_graph_token_burst")
+        )
         self._benchmark_forced_token_id = _env_int(
             "MEGAGEMM_BENCHMARK_FORCED_TOKEN_ID", -1
         )
@@ -447,6 +457,8 @@ class Scheduler:
         self._decode_graph_token_feedback_copies = 0
         self._decode_graph_persistent_feedback_steps = 0
         self._decode_graph_chain_input_updates_skipped = 0
+        self._decode_native_graph_bursts = 0
+        self._decode_native_graph_burst_steps = 0
         self._decode_graph_chain_started_keys = set()
         self._decode_graph_last_feedback_persistent = False
         self._prefill_cuda_graphs = _env_bool(
@@ -555,6 +567,8 @@ class Scheduler:
         self._decode_graph_token_feedback_copies = 0
         self._decode_graph_persistent_feedback_steps = 0
         self._decode_graph_chain_input_updates_skipped = 0
+        self._decode_native_graph_bursts = 0
+        self._decode_native_graph_burst_steps = 0
         self._decode_graph_chain_started_keys.clear()
         self._decode_graph_last_feedback_persistent = False
 
@@ -2462,6 +2476,50 @@ class Scheduler:
         )
         return state.get("block_signature") == block_signature
 
+    def _run_native_decode_graph_token_burst(
+        self,
+        seq_ids: List[int],
+        burst_tokens: torch.Tensor,
+        num_steps: int,
+    ) -> bool:
+        """Replay an already-captured persistent graph in one native call.
+
+        This path deliberately requires an established persistent-feedback
+        chain.  Graph warmup/capture stays on the ordinary audited path; after
+        capture, no model or layer Python callback runs between token steps.
+        """
+        if not self._decode_native_graph_burst:
+            return False
+        if not self._decode_graph_persistent_chain_ready(seq_ids):
+            return False
+
+        key = self._decode_graph_shape_key(
+            seq_ids,
+            return_next_token=True,
+            chain_graph_inputs=True,
+        )
+        state = self._decode_graph_shape_states.get(key)
+        if state is None or state.get("graph") is None or state.get("logits") is None:
+            return False
+
+        # The extension validates every tensor before issuing the first replay.
+        # A replay failure leaves graph-owned state potentially advanced, so it
+        # must be surfaced instead of silently executing the tokens twice.
+        _decode_native_ops.run_cuda_graph_token_burst(
+            state["graph"],
+            state["logits"],
+            burst_tokens,
+            int(num_steps),
+        )
+        self._decode_graph_replay_count += int(num_steps)
+        self._advance_decode_graph_python_seq_lens(seq_ids, int(num_steps))
+        self._mark_decode_graph_shape_state_synced(state, seq_ids)
+        self._decode_graph_last_feedback_persistent = True
+        self._decode_graph_persistent_feedback_steps += int(num_steps)
+        self._decode_native_graph_bursts += 1
+        self._decode_native_graph_burst_steps += int(num_steps)
+        return True
+
     def _decode_batch(self) -> List[Request]:
         """Decode one token for all running requests in a single batch.
 
@@ -2604,19 +2662,28 @@ class Scheduler:
             self._decode_vectorized_input_updates += 1
 
         burst_tokens = self._decode_burst_tokens[:num_seqs, :actual_steps]
-        for step in range(actual_steps):
-            next_tokens = self._run_decode_step(
+        native_burst = bool(
+            resume_persistent_chain
+            and self._run_native_decode_graph_token_burst(
                 seq_ids,
-                buf_ids,
-                buf_pos,
-                return_next_token=True,
-            ).reshape(num_seqs)
-            burst_tokens[:, step].copy_(next_tokens)
-            if step + 1 < actual_steps:
-                if not self._decode_graph_last_feedback_persistent:
-                    buf_ids[:, 0].copy_(next_tokens)
-                    buf_pos.add_(1)
-                    self._decode_graph_token_feedback_copies += 1
+                burst_tokens,
+                actual_steps,
+            )
+        )
+        if not native_burst:
+            for step in range(actual_steps):
+                next_tokens = self._run_decode_step(
+                    seq_ids,
+                    buf_ids,
+                    buf_pos,
+                    return_next_token=True,
+                ).reshape(num_seqs)
+                burst_tokens[:, step].copy_(next_tokens)
+                if step + 1 < actual_steps:
+                    if not self._decode_graph_last_feedback_persistent:
+                        buf_ids[:, 0].copy_(next_tokens)
+                        buf_pos.add_(1)
+                        self._decode_graph_token_feedback_copies += 1
 
         if hasattr(self.block_manager, 'evict_cold_blocks'):
             self.block_manager.evict_cold_blocks(seq_ids)
@@ -2885,6 +2952,13 @@ class Scheduler:
                 ),
                 'persistent_token_feedback_steps': int(
                     self._decode_graph_persistent_feedback_steps
+                ),
+                'native_token_burst_enabled': bool(
+                    self._decode_native_graph_burst
+                ),
+                'native_token_bursts': int(self._decode_native_graph_bursts),
+                'native_token_burst_steps': int(
+                    self._decode_native_graph_burst_steps
                 ),
                 'chain_input_updates_skipped': int(
                     self._decode_graph_chain_input_updates_skipped

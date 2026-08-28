@@ -941,6 +941,34 @@ def _gemma4_a100_a4b_decode_graph_shape(
     )
 
 
+def _gemma4_l4_e2b_decode_graph_shape(
+    config,
+    *,
+    num_seqs: int,
+    dtype: torch.dtype,
+    device_type: str,
+    device_name: str,
+) -> bool:
+    """Exact graph policy for the native Gemma 4 E2B/L4 decode executor."""
+    layer_types = list(getattr(config, "layer_types", ()) or ())
+    return bool(
+        str(getattr(config, "model_type", "")) == "gemma4_text"
+        and not bool(getattr(config, "enable_moe_block", False))
+        and int(getattr(config, "hidden_size", 0)) == 1536
+        and int(getattr(config, "num_hidden_layers", 0)) == 35
+        and int(getattr(config, "num_attention_heads", 0)) == 8
+        and int(getattr(config, "num_key_value_heads", 0)) == 1
+        and int(getattr(config, "num_kv_shared_layers", 0)) == 20
+        and len(layer_types) == 35
+        and layer_types.count("sliding_attention") == 28
+        and layer_types.count("full_attention") == 7
+        and int(num_seqs) == 8
+        and dtype == torch.bfloat16
+        and str(device_type) == "cuda"
+        and "L4" in str(device_name).upper()
+    )
+
+
 def _gemma4_a100_a4b_tuned_lm_head_shape(
     model_type: str,
     rows: int,
@@ -11179,12 +11207,21 @@ class MegaGemmLlama(nn.Module):
         device_type: str,
         device_name: str,
     ) -> bool:
-        return _gemma4_a100_a4b_decode_graph_shape(
-            self.config,
-            num_seqs=num_seqs,
-            dtype=dtype,
-            device_type=device_type,
-            device_name=device_name,
+        return bool(
+            _gemma4_l4_e2b_decode_graph_shape(
+                self.config,
+                num_seqs=num_seqs,
+                dtype=dtype,
+                device_type=device_type,
+                device_name=device_name,
+            )
+            or _gemma4_a100_a4b_decode_graph_shape(
+                self.config,
+                num_seqs=num_seqs,
+                dtype=dtype,
+                device_type=device_type,
+                device_name=device_name,
+            )
         )
 
     def _compute_per_layer_inputs(
@@ -11716,13 +11753,22 @@ class MegaGemmLlama(nn.Module):
         weight = self.lm_head.weight
         return bool(
             weight.is_cuda
-            and _gemma4_a100_a4b_batch_cublas_lm_head_shape(
-                self.config.model_type,
-                int(num_seqs),
-                int(weight.shape[-1]),
-                int(weight.shape[0]),
-                weight.dtype,
-                torch.cuda.get_device_name(weight.device),
+            and (
+                _gemma4_l4_e2b_decode_graph_shape(
+                    self.config,
+                    num_seqs=int(num_seqs),
+                    dtype=weight.dtype,
+                    device_type=weight.device.type,
+                    device_name=torch.cuda.get_device_name(weight.device),
+                )
+                or _gemma4_a100_a4b_batch_cublas_lm_head_shape(
+                    self.config.model_type,
+                    int(num_seqs),
+                    int(weight.shape[-1]),
+                    int(weight.shape[0]),
+                    weight.dtype,
+                    torch.cuda.get_device_name(weight.device),
+                )
             )
         )
 

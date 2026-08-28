@@ -249,6 +249,61 @@ py::tuple run_decode_steps_full_attention(
     return py::make_tuple(all_tokens, final_logits);
 }
 
+void run_cuda_graph_token_burst(
+    py::object graph,
+    torch::Tensor graph_tokens,
+    torch::Tensor burst_tokens,
+    int64_t num_steps
+) {
+    TORCH_CHECK(num_steps > 0, "num_steps must be positive");
+    TORCH_CHECK(graph_tokens.defined(), "graph_tokens must be defined");
+    TORCH_CHECK(burst_tokens.defined(), "burst_tokens must be defined");
+    TORCH_CHECK(graph_tokens.is_cuda(), "graph_tokens must be a CUDA tensor");
+    TORCH_CHECK(burst_tokens.is_cuda(), "burst_tokens must be a CUDA tensor");
+    TORCH_CHECK(
+        graph_tokens.is_contiguous(),
+        "graph_tokens must be contiguous so replay updates remain visible"
+    );
+    TORCH_CHECK(
+        burst_tokens.dim() == 2,
+        "burst_tokens must have shape [batch, steps]"
+    );
+    TORCH_CHECK(
+        burst_tokens.size(1) >= num_steps,
+        "burst_tokens does not have enough step columns"
+    );
+    TORCH_CHECK(
+        graph_tokens.numel() == burst_tokens.size(0),
+        "graph token count must match burst batch size"
+    );
+    TORCH_CHECK(
+        graph_tokens.scalar_type() == burst_tokens.scalar_type(),
+        "graph_tokens and burst_tokens must have the same dtype"
+    );
+    TORCH_CHECK(
+        graph_tokens.device() == burst_tokens.device(),
+        "graph_tokens and burst_tokens must be on the same device"
+    );
+
+    // The captured one-step graph owns token feedback and position updates.  The
+    // only CPython boundary below is the native torch CUDAGraph.replay binding;
+    // no model/layer Python callback is invoked inside the burst.  Keeping this
+    // loop in the extension also prevents the scheduler from returning to the
+    // Python interpreter between token steps.
+    py::object replay = graph.attr("replay");
+    PyObject* replay_callable = replay.ptr();
+    auto flat_tokens = graph_tokens.view({-1});
+    for (int64_t step = 0; step < num_steps; ++step) {
+        py::object replay_result = vectorcall_positional(
+            replay_callable,
+            nullptr,
+            0
+        );
+        (void)replay_result;
+        burst_tokens.select(1, step).copy_(flat_tokens);
+    }
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "MegaGemm decode-loop C++ helpers";
     m.def(
@@ -301,5 +356,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("sin"),
         py::arg("num_steps"),
         py::arg("embed_scale")
+    );
+    m.def(
+        "run_cuda_graph_token_burst",
+        &run_cuda_graph_token_burst,
+        py::arg("graph"),
+        py::arg("graph_tokens"),
+        py::arg("burst_tokens"),
+        py::arg("num_steps"),
+        "Replay a persistent-feedback CUDA graph burst without a Python token loop."
     );
 }

@@ -338,6 +338,94 @@ def test_scheduler_graph_token_burst_keeps_feedback_on_device():
     assert scheduler._decode_vectorized_input_updates == 1
 
 
+def test_scheduler_native_graph_burst_avoids_python_decode_loop(monkeypatch):
+    import importlib
+
+    scheduler_module = importlib.import_module("megagemm.engine.scheduler")
+    blocks = _FakeBlockManager()
+    scheduler = Scheduler(
+        _GreedyTokenBurstModel(), blocks, max_batch_size=2, device="cpu"
+    )
+    requests = []
+    for seq_id, prompt, first_token in (
+        (0, [1, 2, 3], 11),
+        (1, [4, 5], 21),
+    ):
+        blocks.allocate_sequence(seq_id, len(prompt))
+        blocks.seq_lens[seq_id] = len(prompt)
+        request = Request(
+            request_id=seq_id,
+            seq_id=seq_id,
+            prompt_ids=prompt,
+            generated_ids=[first_token],
+            status=RequestStatus.RUNNING,
+            max_new_tokens=5,
+            temperature=0.0,
+        )
+        scheduler._running[seq_id] = request
+        requests.append(request)
+
+    graph_tokens = torch.tensor([11, 21], dtype=torch.long)
+
+    class _FakeGraph:
+        def replay(self):
+            graph_tokens.add_(1)
+
+    class _FakeNativeOps:
+        @staticmethod
+        def run_cuda_graph_token_burst(graph, tokens, output, num_steps):
+            assert tokens is graph_tokens
+            for step in range(int(num_steps)):
+                graph.replay()
+                output[:, step].copy_(tokens)
+
+    seq_ids = [0, 1]
+    scheduler._decode_cuda_graphs = True
+    scheduler._decode_cuda_graph_shape_cache = True
+    scheduler._decode_graph_persistent_token_feedback = True
+    scheduler._decode_native_graph_burst = True
+    scheduler._batch_changed = False
+    key = scheduler._decode_graph_shape_key(
+        seq_ids,
+        return_next_token=True,
+        chain_graph_inputs=True,
+    )
+    scheduler._decode_graph_shape_states[key] = {
+        "graph": _FakeGraph(),
+        "logits": graph_tokens,
+        "seq_key": tuple(seq_ids),
+        "block_signature": tuple(
+            tuple(blocks.block_tables[seq_id]) for seq_id in seq_ids
+        ),
+        "return_next_token": True,
+    }
+    scheduler._decode_graph_chain_started_keys.add(key)
+    monkeypatch.setattr(scheduler_module, "_decode_native_ops", _FakeNativeOps())
+    monkeypatch.setattr(
+        scheduler,
+        "_run_decode_step",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("native burst returned to the Python decode loop")
+        ),
+    )
+
+    finished = scheduler._decode_graph_token_burst_batch(3)
+
+    assert finished == []
+    assert [request.generated_ids for request in requests] == [
+        [11, 12, 13, 14],
+        [21, 22, 23, 24],
+    ]
+    assert blocks.seq_lens == {0: 6, 1: 5}
+    assert scheduler._decode_graph_replay_count == 3
+    assert scheduler._decode_native_graph_bursts == 1
+    assert scheduler._decode_native_graph_burst_steps == 3
+    stats = scheduler.get_stats()["decode_cuda_graphs"]
+    assert stats["native_token_burst_enabled"] is True
+    assert stats["native_token_bursts"] == 1
+    assert stats["native_token_burst_steps"] == 3
+
+
 def test_shared_decode_graph_is_invalidated_on_physical_kv_rebind(monkeypatch):
     monkeypatch.setenv("MEGAGEMM_DECODE_CUDA_GRAPHS_SHARED_SHAPE_CACHE", "1")
     blocks = _FakeBlockManager()
