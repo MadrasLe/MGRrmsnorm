@@ -272,6 +272,7 @@ def main() -> int:
     decision = "INCOMPLETE"
     gain_vs_one_step = 0.0
     gain_vs_eager = 0.0
+    one_step_vs_eager = 0.0
     token_parity = {
         "unrolled_matches_one_step": False,
         "one_step_matches_eager": False,
@@ -300,6 +301,11 @@ def main() -> int:
             / float(eager["median_decode_tps"])
             - 1.0
         ) * 100.0
+        one_step_vs_eager = (
+            float(control["median_decode_tps"])
+            / float(eager["median_decode_tps"])
+            - 1.0
+        ) * 100.0
         if not all(token_parity.values()):
             decision = "UNROLLED_CORRECTNESS_FAILURE"
         elif gain_vs_one_step >= 0.5 and gain_vs_eager >= 0.0:
@@ -308,8 +314,10 @@ def main() -> int:
                 if args.reuse_scheduler
                 else "UNROLLED_GRAPH_WINS_COLD_REQUEST"
             )
-        else:
+        elif one_step_vs_eager >= 0.5:
             decision = "KEEP_ONE_STEP_GRAPH"
+        else:
+            decision = "KEEP_EAGER_MULTI_STEP"
 
     payload = {
         "decision": decision,
@@ -322,6 +330,7 @@ def main() -> int:
         "token_parity": token_parity,
         "unrolled_vs_one_step_percent": gain_vs_one_step,
         "unrolled_vs_eager_percent": gain_vs_eager,
+        "one_step_vs_eager_percent": one_step_vs_eager,
         "results": results,
     }
     decision_path = out_root / "decision.json"
