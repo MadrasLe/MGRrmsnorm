@@ -299,35 +299,55 @@ def main() -> int:
     )
     native = next((x for x in successful if x["name"] == "native_graph_burst"), None)
     decision = "INCOMPLETE"
+    blockers: list[str] = []
+    token_parity = {
+        "native_matches_python_graph": False,
+        "python_graph_matches_eager": False,
+        "native_matches_eager": False,
+    }
     native_vs_eager = 0.0
     native_vs_python_graph = 0.0
     if eager and python_graph and native:
-        digests = {
-            str(eager["generated_token_digest"]),
-            str(python_graph["generated_token_digest"]),
-            str(native["generated_token_digest"]),
+        eager_digest = str(eager["generated_token_digest"])
+        python_graph_digest = str(python_graph["generated_token_digest"])
+        native_digest = str(native["generated_token_digest"])
+        token_parity = {
+            "native_matches_python_graph": native_digest == python_graph_digest,
+            "python_graph_matches_eager": python_graph_digest == eager_digest,
+            "native_matches_eager": native_digest == eager_digest,
         }
-        if len(digests) != 1:
-            decision = "CORRECTNESS_FAILURE"
+        native_vs_eager = (
+            float(native["median_decode_tps"])
+            / float(eager["median_decode_tps"])
+            - 1.0
+        ) * 100.0
+        native_vs_python_graph = (
+            float(native["median_decode_tps"])
+            / float(python_graph["median_decode_tps"])
+            - 1.0
+        ) * 100.0
+
+        # Native and Python graph execute the identical captured device work;
+        # this is the correctness reference for the C++ orchestration change.
+        # Eager multi-step uses a different decode implementation, so a digest
+        # difference there is a separate graph-vs-production blocker rather
+        # than evidence that the native burst itself reordered tokens.
+        if not token_parity["native_matches_python_graph"]:
+            blockers.append("native_python_graph_token_divergence")
+            decision = "NATIVE_CORRECTNESS_FAILURE"
         else:
-            native_vs_eager = (
-                float(native["median_decode_tps"])
-                / float(eager["median_decode_tps"])
-                - 1.0
-            ) * 100.0
-            native_vs_python_graph = (
-                float(native["median_decode_tps"])
-                / float(python_graph["median_decode_tps"])
-                - 1.0
-            ) * 100.0
-            decision = (
-                "PROMOTE_NATIVE_EXECUTOR"
-                if native_vs_eager >= 2.0 and native_vs_python_graph >= 0.5
-                else "KEEP_EXPERIMENTAL"
-            )
+            if not token_parity["python_graph_matches_eager"]:
+                blockers.append("python_graph_eager_token_divergence")
+            if native_vs_eager < 2.0:
+                blockers.append("native_gain_vs_eager_below_2_percent")
+            if native_vs_python_graph < 0.5:
+                blockers.append("native_gain_vs_python_graph_below_0_5_percent")
+            decision = "PROMOTE_NATIVE_EXECUTOR" if not blockers else "KEEP_EXPERIMENTAL"
 
     payload = {
         "decision": decision,
+        "blockers": blockers,
+        "token_parity": token_parity,
         "native_vs_eager_percent": native_vs_eager,
         "native_vs_python_graph_percent": native_vs_python_graph,
         "results": results,
@@ -336,7 +356,7 @@ def main() -> int:
     decision_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     print("\nDECISION " + json.dumps(payload, separators=(",", ":")))
     print(f"wrote {decision_path}")
-    if decision == "CORRECTNESS_FAILURE":
+    if decision == "NATIVE_CORRECTNESS_FAILURE":
         return 3
     return 0 if len(successful) == len(CASES) else 2
 
