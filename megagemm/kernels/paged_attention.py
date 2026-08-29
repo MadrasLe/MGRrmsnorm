@@ -140,6 +140,7 @@ def _decode_num_warps(
     device: Optional[torch.device] = None,
     *,
     num_splits: int = 1,
+    policy_override: Optional[int] = None,
 ) -> int:
     shape_forced = _env_int(
         f"MEGAGEMM_PAGED_DECODE_WARPS_H{int(head_dim)}",
@@ -152,6 +153,12 @@ def _decode_num_warps(
     )
     if forced > 0:
         return max(1, min(forced, 8))
+    try:
+        promoted = int(policy_override or 0)
+    except (TypeError, ValueError):
+        promoted = 0
+    if promoted > 0:
+        return max(1, min(promoted, 8))
     if head_dim < 128:
         return 4
 
@@ -3499,7 +3506,8 @@ def _triton_paged_decode_fused(query, kv_cache, block_tables, seq_lens, scale,
                                 out=None, sliding_window: Optional[int] = None,
                                 max_blocks_override: Optional[int] = None,
                                 split_policy_override: Optional[int] = None,
-                                gqa2_direct_policy_enabled: Optional[bool] = None):
+                                gqa2_direct_policy_enabled: Optional[bool] = None,
+                                num_warps_policy_override: Optional[int] = None):
     """Triton fused QK-Norm + RoPE + paged attention decode."""
     num_seqs, num_q_heads, head_dim = query.shape
     num_kv_heads = kv_cache.shape[2]
@@ -3571,7 +3579,11 @@ def _triton_paged_decode_fused(query, kv_cache, block_tables, seq_lens, scale,
                     f"({_GROUPED_SEGMENTED_DECODE_FAILURE})"
                 )
 
-    num_warps = _decode_num_warps(head_dim, query.device)
+    num_warps = _decode_num_warps(
+        head_dim,
+        query.device,
+        policy_override=num_warps_policy_override,
+    )
     planned_q_heads = _planned_fused_decode_program_heads(
         num_q_heads=num_q_heads,
         num_kv_heads=num_kv_heads,
@@ -3585,7 +3597,12 @@ def _triton_paged_decode_fused(query, kv_cache, block_tables, seq_lens, scale,
         device=query.device,
         policy_override=split_policy_override,
     )
-    num_warps = _decode_num_warps(head_dim, query.device, num_splits=num_splits)
+    num_warps = _decode_num_warps(
+        head_dim,
+        query.device,
+        num_splits=num_splits,
+        policy_override=num_warps_policy_override,
+    )
     reduce_warps = _decode_reduce_num_warps(head_dim, num_splits)
     window_size = int(sliding_window or 0)
     _log_decode_shape_once(

@@ -26,6 +26,7 @@ def test_e2b_l4_policy_preserves_measured_multi_step_triton_path():
     assert policy.reuse_request_scheduler is False
     assert policy.paged_decode_splits == 1
     assert policy.paged_decode_gqa2_direct is True
+    assert policy.paged_decode_warps_h256 == 2
     assert policy.gemma4_dense_post_norm_chain is True
     assert policy.gemma4_e2b_l4_sliding_prefill is True
     assert policy.gemma4_bf16_fused_gateup_rows == ()
@@ -43,6 +44,7 @@ def test_e4b_l4_policy_preserves_measured_step_and_reuse_path():
     assert policy.reuse_request_scheduler is True
     assert policy.paged_decode_splits == 0
     assert policy.paged_decode_gqa2_direct is False
+    assert policy.paged_decode_warps_h256 == 0
     assert policy.gemma4_dense_post_norm_chain is False
     assert policy.gemma4_e2b_l4_sliding_prefill is False
     assert policy.gemma4_bf16_fused_gateup_rows == ()
@@ -59,6 +61,7 @@ def test_gemma4_policy_is_not_promoted_to_unmeasured_hardware():
     assert policy.reuse_request_scheduler is False
     assert policy.paged_decode_splits == 0
     assert policy.paged_decode_gqa2_direct is False
+    assert policy.paged_decode_warps_h256 == 0
     assert policy.gemma4_dense_post_norm_chain is False
     assert policy.gemma4_e2b_l4_sliding_prefill is False
     assert policy.gemma4_bf16_fused_gateup_rows == ()

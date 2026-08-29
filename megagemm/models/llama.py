@@ -16858,6 +16858,9 @@ class MegaGemmLlama(nn.Module):
         paged_decode_gqa2_direct = bool(
             getattr(self.runtime_policy, "paged_decode_gqa2_direct", False)
         )
+        paged_decode_warps_h256 = int(
+            getattr(self.runtime_policy, "paged_decode_warps_h256", 0) or 0
+        )
         int8_inline = getattr(self, '_flat_int8_inline', False)
         if int8_inline:
             int8_x_buf = self._flat_int8_x_buf
@@ -17024,6 +17027,11 @@ class MegaGemmLlama(nn.Module):
                     sliding_window=lw.sliding_window if lw.sliding_window > 0 else None,
                     split_policy_override=paged_decode_splits or None,
                     gqa2_direct_policy_enabled=paged_decode_gqa2_direct,
+                    num_warps_policy_override=(
+                        paged_decode_warps_h256
+                        if int(lw.head_dim) == 256
+                        else None
+                    ),
                 )
                 _timing_record_end(timing_events, "attn_core", attn_core_start_end)
                 if timing_events is not None and attn_core_start_end is not None and attn_core_start_end[0] is not None:

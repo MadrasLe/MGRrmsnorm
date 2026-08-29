@@ -215,6 +215,46 @@ def test_decode_num_warps_supports_independent_h256_and_h512_overrides():
                 os.environ[name] = value
 
 
+def test_decode_num_warps_uses_policy_after_explicit_environment_override():
+    names = (
+        "MEGAGEMM_PAGED_DECODE_WARPS",
+        "MEGAGEMM_PAGED_DECODE_WARPS_H256",
+    )
+    saved_env = {name: os.environ.pop(name, None) for name in names}
+    old_device_info = paged_attention._cuda_device_info
+    try:
+        paged_attention._cuda_device_info = (
+            lambda _device=None: ((8, 9), "NVIDIA L4", 58)
+        )
+        assert (
+            paged_attention._decode_num_warps(
+                256,
+                torch.device("cuda"),
+                num_splits=1,
+                policy_override=2,
+            )
+            == 2
+        )
+
+        os.environ["MEGAGEMM_PAGED_DECODE_WARPS_H256"] = "8"
+        assert (
+            paged_attention._decode_num_warps(
+                256,
+                torch.device("cuda"),
+                num_splits=1,
+                policy_override=2,
+            )
+            == 8
+        )
+    finally:
+        paged_attention._cuda_device_info = old_device_info
+        for name, value in saved_env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
 def test_gemma4_grouped_segmented_decode_policy_is_shape_selective():
     name = "MEGAGEMM_GEMMA4_GROUPED_SEGMENTED_ATTN_DECODE"
     saved_value = os.environ.get(name)

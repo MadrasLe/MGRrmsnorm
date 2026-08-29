@@ -149,11 +149,19 @@ class Gemma4ColabHarnessTests(unittest.TestCase):
             flat_decode,
         )
         self.assertIn(
+            'getattr(self.runtime_policy, "paged_decode_warps_h256", 0)',
+            flat_decode,
+        )
+        self.assertIn(
             "split_policy_override=paged_decode_splits or None",
             flat_decode,
         )
         self.assertIn(
             "gqa2_direct_policy_enabled=paged_decode_gqa2_direct",
+            flat_decode,
+        )
+        self.assertIn(
+            "num_warps_policy_override=(",
             flat_decode,
         )
 

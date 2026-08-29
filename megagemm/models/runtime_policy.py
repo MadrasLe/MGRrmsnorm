@@ -24,6 +24,7 @@ class RuntimePolicy:
     reuse_request_scheduler: bool = False
     paged_decode_splits: int = 0
     paged_decode_gqa2_direct: bool = False
+    paged_decode_warps_h256: int = 0
     gemma4_dense_post_norm_chain: bool = False
     gemma4_e2b_l4_sliding_prefill: bool = False
     gemma4_bf16_fused_gateup_rows: tuple[int, ...] = ()
@@ -76,13 +77,15 @@ def resolve_runtime_policy(config: Any, device_name: str = "") -> RuntimePolicy:
             reuse_request_scheduler=False,
             paged_decode_splits=1,
             paged_decode_gqa2_direct=True,
+            paged_decode_warps_h256=2,
             gemma4_dense_post_norm_chain=True,
             gemma4_e2b_l4_sliding_prefill=True,
             gemma4_bf16_cublas_gateup_rows=(8,),
             gemma4_bf16_cublas_down_rows=(8,),
             reason=(
                 "validated E2B L4 path: Triton RMSNorm, multi-step eager decode, "
-                "unsplit paged attention with the direct GQA2 kernel, and the "
+                "unsplit two-warp H256 paged attention with the direct GQA2 "
+                "kernel, and the "
                 "dense post-norm chain; the long-context BF16 batch-8 gate "
                 "retains cuBLAS for gate-up and down instead of the slower "
                 "fused gate-up and deepfusion MLP kernels, while "
