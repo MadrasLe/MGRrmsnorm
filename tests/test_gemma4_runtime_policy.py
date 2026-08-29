@@ -28,6 +28,7 @@ def test_e2b_l4_policy_preserves_measured_multi_step_triton_path():
     assert policy.paged_decode_gqa2_direct is True
     assert policy.paged_decode_warps_h256 == 2
     assert policy.gemma4_dense_post_norm_chain is True
+    assert policy.gemma4_e2b_h512_dense_bridge_pair is True
     assert policy.gemma4_ple_conditioned_gelu_decode is False
     assert policy.gemma4_e2b_l4_sliding_prefill is True
     assert policy.gemma4_bf16_fused_gateup_rows == ()
@@ -47,6 +48,7 @@ def test_e4b_l4_policy_preserves_measured_step_and_reuse_path():
     assert policy.paged_decode_gqa2_direct is False
     assert policy.paged_decode_warps_h256 == 0
     assert policy.gemma4_dense_post_norm_chain is False
+    assert policy.gemma4_e2b_h512_dense_bridge_pair is False
     assert policy.gemma4_ple_conditioned_gelu_decode is False
     assert policy.gemma4_e2b_l4_sliding_prefill is False
     assert policy.gemma4_bf16_fused_gateup_rows == ()
@@ -65,6 +67,7 @@ def test_gemma4_policy_is_not_promoted_to_unmeasured_hardware():
     assert policy.paged_decode_gqa2_direct is False
     assert policy.paged_decode_warps_h256 == 0
     assert policy.gemma4_dense_post_norm_chain is False
+    assert policy.gemma4_e2b_h512_dense_bridge_pair is False
     assert policy.gemma4_ple_conditioned_gelu_decode is False
     assert policy.gemma4_e2b_l4_sliding_prefill is False
     assert policy.gemma4_bf16_fused_gateup_rows == ()
@@ -112,6 +115,29 @@ def test_explicit_environment_can_disable_promoted_e2b_dense_chain(monkeypatch):
         model,
         "MEGAGEMM_GEMMA4_DENSE_POST_NORM_CHAIN_DECODE",
         "gemma4_dense_post_norm_chain",
+    ) is False
+
+
+def test_explicit_environment_can_disable_promoted_e2b_h512_bridge_pair(
+    monkeypatch,
+):
+    model = SimpleNamespace(
+        runtime_policy=resolve_runtime_policy(
+            _config(35, 1536, 8, 1), "NVIDIA L4"
+        )
+    )
+
+    assert policy_bool(
+        model,
+        "MEGAGEMM_GEMMA4_DENSE_ATTN_MLP_BRIDGE_DECODE",
+        "gemma4_e2b_h512_dense_bridge_pair",
+    ) is True
+
+    monkeypatch.setenv("MEGAGEMM_GEMMA4_DENSE_ATTN_MLP_BRIDGE_DECODE", "0")
+    assert policy_bool(
+        model,
+        "MEGAGEMM_GEMMA4_DENSE_ATTN_MLP_BRIDGE_DECODE",
+        "gemma4_e2b_h512_dense_bridge_pair",
     ) is False
 
 

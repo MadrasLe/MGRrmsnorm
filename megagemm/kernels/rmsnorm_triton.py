@@ -25,6 +25,7 @@ __all__ = [
     "rmsnorm_triton_add_dual",
     "rmsnorm_triton_add_dual_router",
     "rmsnorm_triton_attn_residual_dual",
+    "rmsnorm_triton_attn_residual_dense",
     "rmsnorm_triton_attn_residual_router_bridge",
     "rmsnorm_triton_attn_residual_router_bridge_single",
     "rmsnorm_triton_dual",
@@ -483,6 +484,82 @@ if _HAS_TRITON:
         tl.store(
             router_out_ptr + row * router_stride_row + safe_cols,
             router_out,
+            mask=mask,
+        )
+
+    @triton.jit
+    def _rmsnorm_attn_residual_dense_bridge_kernel(
+        attn_ptr,
+        residual_ptr,
+        post_weight_ptr,
+        pre_ff_weight_ptr,
+        hidden_ptr,
+        pre_ff_out_ptr,
+        n_cols,
+        attn_stride_row,
+        residual_stride_row,
+        hidden_stride_row,
+        pre_ff_stride_row,
+        eps,
+        POST_OFFSET: tl.constexpr,
+        PRE_FF_OFFSET: tl.constexpr,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        """One-pass dense attention -> FFN bridge with eager BF16 staging."""
+        row = tl.program_id(0)
+        cols = tl.arange(0, BLOCK_SIZE)
+        mask = cols < n_cols
+        safe_cols = tl.minimum(cols, n_cols - 1)
+
+        attn = tl.load(
+            attn_ptr + row * attn_stride_row + safe_cols,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        attn_var = tl.sum(attn * attn, axis=0) / n_cols
+        post_weight = tl.load(
+            post_weight_ptr + safe_cols,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        if POST_OFFSET:
+            post_weight += 1.0
+
+        # These explicit casts are semantic, not merely storage choices.  They
+        # match the two materialized BF16/FP16 tensors in the former eager
+        # sequence: post-attention RMSNorm, then residual add.
+        post_norm = (
+            attn * (1.0 / tl.sqrt(attn_var + eps)) * post_weight
+        ).to(hidden_ptr.dtype.element_ty)
+        residual = tl.load(
+            residual_ptr + row * residual_stride_row + safe_cols,
+            mask=mask,
+            other=0.0,
+        )
+        hidden = (residual + post_norm).to(hidden_ptr.dtype.element_ty)
+        tl.store(
+            hidden_ptr + row * hidden_stride_row + safe_cols,
+            hidden,
+            mask=mask,
+        )
+
+        hidden_f32 = hidden.to(tl.float32)
+        hidden_var = tl.sum(hidden_f32 * hidden_f32, axis=0) / n_cols
+        pre_ff_weight = tl.load(
+            pre_ff_weight_ptr + safe_cols,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        if PRE_FF_OFFSET:
+            pre_ff_weight += 1.0
+        pre_ff = (
+            hidden_f32
+            * (1.0 / tl.sqrt(hidden_var + eps))
+            * pre_ff_weight
+        )
+        tl.store(
+            pre_ff_out_ptr + row * pre_ff_stride_row + safe_cols,
+            pre_ff,
             mask=mask,
         )
 
@@ -1038,6 +1115,126 @@ def rmsnorm_triton_attn_residual_dual(
         shared_out=shared_out,
         expert_out=expert_out,
     )
+
+
+def rmsnorm_triton_attn_residual_dense(
+    attn_out: torch.Tensor,
+    residual: torch.Tensor,
+    post_attn_weight: torch.Tensor,
+    pre_ff_weight: torch.Tensor,
+    eps: float = 1e-5,
+    *,
+    norm_offset: bool = False,
+    out_hidden: Optional[torch.Tensor] = None,
+    pre_ff_out: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fuse Gemma4's dense post-attention norm/add/pre-FFN norm bridge.
+
+    The kernel deliberately preserves the eager low-precision materialization
+    after the post-attention RMSNorm and after the residual add.  It therefore
+    remains numerically equivalent to ``norm -> add_ -> norm`` while replacing
+    three launches with one for the E2B BF16 decode path.
+    """
+    if attn_out.shape != residual.shape:
+        raise ValueError("dense attention bridge inputs must have the same shape")
+    n_cols = int(attn_out.shape[-1])
+    if (
+        int(post_attn_weight.numel()) != n_cols
+        or int(pre_ff_weight.numel()) != n_cols
+    ):
+        raise ValueError(
+            "dense attention bridge weights must match the last dimension"
+        )
+    for name, output in (
+        ("out_hidden", out_hidden),
+        ("pre_ff_out", pre_ff_out),
+    ):
+        if output is None:
+            continue
+        if output.shape != attn_out.shape:
+            raise ValueError(
+                f"dense attention bridge {name} shape must match inputs"
+            )
+        if output.device != attn_out.device or output.dtype != attn_out.dtype:
+            raise ValueError(
+                f"dense attention bridge {name} device/dtype must match inputs"
+            )
+        if not output.is_contiguous():
+            raise ValueError(
+                f"dense attention bridge {name} must be contiguous"
+            )
+
+    can_use_triton = bool(
+        _HAS_TRITON
+        and attn_out.is_cuda
+        and residual.is_cuda
+        and residual.device == attn_out.device
+        and residual.dtype == attn_out.dtype
+        and attn_out.is_contiguous()
+        and residual.is_contiguous()
+        and post_attn_weight.is_cuda
+        and pre_ff_weight.is_cuda
+        and post_attn_weight.device == attn_out.device
+        and pre_ff_weight.device == attn_out.device
+        and post_attn_weight.is_contiguous()
+        and pre_ff_weight.is_contiguous()
+        and 0 < n_cols <= 8192
+    )
+    if not can_use_triton:
+        post_norm = _pytorch_rmsnorm(
+            attn_out,
+            post_attn_weight,
+            eps,
+            norm_offset,
+        )
+        hidden = (residual + post_norm).to(residual.dtype)
+        if out_hidden is not None:
+            out_hidden.copy_(hidden)
+            hidden = out_hidden
+        pre_ff = _pytorch_rmsnorm(
+            hidden,
+            pre_ff_weight,
+            eps,
+            norm_offset,
+        )
+        if pre_ff_out is not None:
+            pre_ff_out.copy_(pre_ff)
+            pre_ff = pre_ff_out
+        return hidden, pre_ff
+
+    attn_2d = attn_out.reshape(-1, n_cols)
+    residual_2d = residual.reshape(-1, n_cols)
+    hidden_2d = (
+        torch.empty_like(attn_2d)
+        if out_hidden is None
+        else out_hidden.reshape(-1, n_cols)
+    )
+    pre_ff_2d = (
+        torch.empty_like(attn_2d)
+        if pre_ff_out is None
+        else pre_ff_out.reshape(-1, n_cols)
+    )
+    block_size = triton.next_power_of_2(n_cols)
+    num_warps = min(4, max(1, block_size // 256))
+    _rmsnorm_attn_residual_dense_bridge_kernel[(attn_2d.shape[0],)](
+        attn_2d,
+        residual_2d,
+        post_attn_weight,
+        pre_ff_weight,
+        hidden_2d,
+        pre_ff_2d,
+        n_cols,
+        attn_2d.stride(0),
+        residual_2d.stride(0),
+        hidden_2d.stride(0),
+        pre_ff_2d.stride(0),
+        eps,
+        POST_OFFSET=bool(norm_offset),
+        PRE_FF_OFFSET=bool(norm_offset),
+        BLOCK_SIZE=block_size,
+        num_warps=num_warps,
+    )
+    return hidden_2d.reshape_as(attn_out), pre_ff_2d.reshape_as(attn_out)
 
 
 def rmsnorm_triton_attn_residual_router_bridge(

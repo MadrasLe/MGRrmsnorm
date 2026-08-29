@@ -283,4 +283,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("rope_backward", &rope_backward, "RoPE backward (CUDA) - supports FP32/FP16");
     m.def("swiglu_forward_cuda", &swiglu_forward_cuda, "SwiGLU forward (CUDA, FP16)");
     m.def("mlp_prefill_forward_cuda", &mlp_prefill_forward_cuda, "MLP prefill forward (CUDA, FP16)");
+    m.def(
+        "cublaslt_bf16_algorithm_count_cuda",
+        &cublaslt_bf16_algorithm_count_cuda,
+        "Return available cuBLASLt BF16 heuristics for input @ weight.T"
+    );
+    m.def(
+        "cublaslt_bf16_linear_cuda",
+        &cublaslt_bf16_linear_cuda,
+        "cuBLASLt BF16 linear with an explicit heuristic index"
+    );
 }

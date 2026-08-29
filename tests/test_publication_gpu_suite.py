@@ -341,6 +341,24 @@ def test_e2b_audit_proves_batch8_cublas_mlp_policy_and_zero_fusion_hits(tmp_path
             "gemma4_policy_bf16_cublas_down_rows": [8],
             "gemma4_flat_fused_gateup_hits": 0,
             "gemma4_flat_deepfusion_hits": 0,
+            "runtime_policy": {
+                "gemma4_e2b_h512_dense_bridge_pair": True,
+            },
+            "gemma4_dense_attn_mlp_bridge_decode_enabled": True,
+            "gemma4_dense_attn_mlp_bridge_decode_hits": 4445,
+            "gemma4_dense_attn_mlp_bridge_runtime_disabled": False,
+            "gemma4_dense_attn_mlp_bridge_failure": "",
+            "paged_decode_runtime": {
+                "grouped_segmented_hits": 889,
+                "grouped_segmented_disabled": False,
+                "grouped_segmented_failure": "",
+                "grouped_segmented_selected_segments": {
+                    "e2b_l4_full_h512_gqa8": 32,
+                },
+                "grouped_segmented_selected_tile_sizes": {
+                    "e2b_l4_full_h512_gqa8": 16,
+                },
+            },
         },
         "scheduler_stats": {
             "decode_execution": {
@@ -362,6 +380,10 @@ def test_e2b_audit_proves_batch8_cublas_mlp_policy_and_zero_fusion_hits(tmp_path
     assert report["required"]["batch8_cublas_down_policy_rows"] == [[8]]
     assert report["required"]["batch8_fused_gateup_hits"] == 0
     assert report["required"]["batch8_deepfusion_hits"] == 0
+    assert report["required"]["e2b_h512_dense_bridge_pair_policy_enabled"] is True
+    assert report["required"]["e2b_h512_grouped_attention_segments"] == [32]
+    assert report["required"]["e2b_h512_grouped_attention_tiles"] == [16]
+    assert report["required"]["e2b_dense_attn_mlp_bridge_hits"] == 4445
 
     row["decode_runtime_stats"]["gemma4_flat_deepfusion_hits"] = 1
     raw_path.write_text(json.dumps(row) + "\n", encoding="utf-8")
@@ -410,6 +432,24 @@ def test_e2b_audit_requires_promoted_l4_long_sliding_prefill_hits(tmp_path):
             "gemma4_flat_deepfusion_hits": 0,
             "gemma4_e2b_l4_sliding_prefill_enabled": True,
             "gemma4_e2b_l4_sliding_prefill_hits": 224,
+            "runtime_policy": {
+                "gemma4_e2b_h512_dense_bridge_pair": True,
+            },
+            "gemma4_dense_attn_mlp_bridge_decode_enabled": True,
+            "gemma4_dense_attn_mlp_bridge_decode_hits": 4445,
+            "gemma4_dense_attn_mlp_bridge_runtime_disabled": False,
+            "gemma4_dense_attn_mlp_bridge_failure": "",
+            "paged_decode_runtime": {
+                "grouped_segmented_hits": 889,
+                "grouped_segmented_disabled": False,
+                "grouped_segmented_failure": "",
+                "grouped_segmented_selected_segments": {
+                    "e2b_l4_full_h512_gqa8": 32,
+                },
+                "grouped_segmented_selected_tile_sizes": {
+                    "e2b_l4_full_h512_gqa8": 16,
+                },
+            },
         },
         "scheduler_stats": {
             "decode_execution": {

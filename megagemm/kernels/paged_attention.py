@@ -445,6 +445,7 @@ def _grouped_segmented_decode_topology(
     *,
     sliding_window: Optional[int],
     force: bool = False,
+    e2b_l4_h512_policy_enabled: Optional[bool] = None,
 ) -> Optional[str]:
     """Return the measured Gemma4 topology eligible for the new decode core."""
     if _GROUPED_SEGMENTED_DECODE_DISABLED and not force:
@@ -467,17 +468,44 @@ def _grouped_segmented_decode_topology(
     num_seqs, num_q_heads, head_dim = query.shape
     num_kv_heads = int(kv_cache.shape[2])
     block_size = int(kv_cache.shape[3])
-    if num_seqs != 16 or num_q_heads != 16 or block_size != 16:
+    if block_size != 16:
         return None
     if num_kv_heads <= 0 or num_q_heads % num_kv_heads != 0:
         return None
 
     _, device_name, _ = _cuda_device_info(query.device)
-    if "a100" not in _device_name_tokens(device_name):
-        return None
-
+    device_tokens = _device_name_tokens(device_name)
     window = int(sliding_window or 0)
     gqa_ratio = num_q_heads // num_kv_heads
+
+    # Experimental Gemma4 E2B/L4 full-attention path.  Keep the gate separate
+    # from the already-promoted A4B/A100 topology: E2B has half the batch and a
+    # single KV head, so copying the A100 policy blindly is not valid.  The
+    # checkpoint-free shape gate uses force=True; the loaded model opts in with
+    # the dedicated environment flag only after that gate has selected a
+    # segment/tile configuration.
+    if (
+        (
+            force
+            or _env_bool(
+                "MEGAGEMM_GEMMA4_E2B_L4_H512_GROUPED_ATTN_DECODE",
+                bool(e2b_l4_h512_policy_enabled),
+            )
+        )
+        and "l4" in device_tokens
+        and num_seqs == 8
+        and num_q_heads == 8
+        and head_dim == 512
+        and num_kv_heads == 1
+        and gqa_ratio == 8
+        and window == 0
+    ):
+        return "e2b_l4_full_h512_gqa8"
+
+    if "a100" not in device_tokens:
+        return None
+    if num_seqs != 16 or num_q_heads != 16:
+        return None
     if (
         head_dim == 256
         and num_kv_heads == 8
@@ -500,6 +528,11 @@ def _grouped_segmented_decode_num_segments(
     max_visible_tokens: int,
 ) -> int:
     """Select only A100 segment counts promoted by paid shape gates."""
+    if topology == "e2b_l4_full_h512_gqa8":
+        return _env_int(
+            "MEGAGEMM_GEMMA4_E2B_L4_H512_ATTN_SEGMENTS",
+            32,
+        )
     if topology == "sliding_h256_gqa2" and max_visible_tokens >= 1024:
         return 32
     if topology == "full_h512_gqa8" and max_visible_tokens >= 2048:
@@ -512,6 +545,11 @@ def _grouped_segmented_decode_tile_size(
     max_visible_tokens: int,
 ) -> int:
     """Select only A100 tile sizes promoted by paid shape gates."""
+    if topology == "e2b_l4_full_h512_gqa8":
+        return _env_int(
+            "MEGAGEMM_GEMMA4_E2B_L4_H512_ATTN_TILE",
+            16,
+        )
     if topology == "sliding_h256_gqa2" and max_visible_tokens >= 1024:
         return 64
     if topology == "sliding_h256_gqa2":
@@ -3507,7 +3545,8 @@ def _triton_paged_decode_fused(query, kv_cache, block_tables, seq_lens, scale,
                                 max_blocks_override: Optional[int] = None,
                                 split_policy_override: Optional[int] = None,
                                 gqa2_direct_policy_enabled: Optional[bool] = None,
-                                num_warps_policy_override: Optional[int] = None):
+                                num_warps_policy_override: Optional[int] = None,
+                                e2b_l4_h512_policy_enabled: Optional[bool] = None):
     """Triton fused QK-Norm + RoPE + paged attention decode."""
     num_seqs, num_q_heads, head_dim = query.shape
     num_kv_heads = kv_cache.shape[2]
@@ -3538,6 +3577,7 @@ def _triton_paged_decode_fused(query, kv_cache, block_tables, seq_lens, scale,
         kv_cache,
         block_tables,
         sliding_window=sliding_window,
+        e2b_l4_h512_policy_enabled=e2b_l4_h512_policy_enabled,
     )
     if (
         candidate_topology is not None
@@ -3562,6 +3602,7 @@ def _triton_paged_decode_fused(query, kv_cache, block_tables, seq_lens, scale,
                 out=output,
                 sliding_window=sliding_window,
                 max_blocks_override=max_blocks_override,
+                force=True,
             )
         except Exception as exc:
             _GROUPED_SEGMENTED_DECODE_DISABLED = True

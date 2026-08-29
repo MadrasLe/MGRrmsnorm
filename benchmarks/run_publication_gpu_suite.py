@@ -104,6 +104,7 @@ GEMMA4_PROFILE_REQUIREMENTS = {
         "prefer_step": False,
         "reuse_scheduler": False,
         "require_dense_post_norm_chain": True,
+        "require_e2b_h512_dense_bridge_pair": True,
         "require_bf16_batch8_cublas_mlp": True,
         "require_e2b_l4_sliding_prefill": True,
         "topology": {
@@ -189,6 +190,16 @@ def child_environment(
             # not force flags inherited from an earlier notebook experiment.
             env.pop("MEGAGEMM_GEMMA4_FORCE_FUSED_GATEUP_USE", None)
             env.pop("MEGAGEMM_GEMMA4_FORCE_DEEPFUSION_USE", None)
+            env.pop(
+                "MEGAGEMM_GEMMA4_E2B_L4_H512_GROUPED_ATTN_DECODE",
+                None,
+            )
+            env.pop("MEGAGEMM_GEMMA4_E2B_L4_H512_ATTN_SEGMENTS", None)
+            env.pop("MEGAGEMM_GEMMA4_E2B_L4_H512_ATTN_TILE", None)
+            env.pop("MEGAGEMM_GEMMA4_GROUPED_SEGMENTED_ATTN_WARPS", None)
+            env.pop("MEGAGEMM_GEMMA4_GROUPED_SEGMENTED_ATTN_STAGES", None)
+            env.pop("MEGAGEMM_GEMMA4_GROUPED_SEGMENTED_ATTN_REDUCE_WARPS", None)
+            env.pop("MEGAGEMM_GEMMA4_DENSE_ATTN_MLP_BRIDGE_DECODE", None)
         env.update(profile_environment(profile, model))
     return env
 
@@ -580,6 +591,108 @@ def audit_gemma4_dense_fast_path(path: Path, profile: str) -> dict:
         and isinstance(row.get("decode_runtime_stats"), dict)
     ]
     batch8_decode_stats = [row["decode_runtime_stats"] for row in batch8_rows]
+    batch8_paged_stats = [
+        stats["paged_decode_runtime"]
+        for stats in batch8_decode_stats
+        if isinstance(stats.get("paged_decode_runtime"), dict)
+    ]
+    require_e2b_h512_dense_bridge_pair = bool(
+        requirement.get("require_e2b_h512_dense_bridge_pair", False)
+    )
+    e2b_h512_dense_bridge_pair_applicable = bool(
+        require_e2b_h512_dense_bridge_pair and batch8_rows
+    )
+    pair_policy_enabled = bool(
+        batch8_decode_stats
+        and all(
+            bool(
+                (stats.get("runtime_policy") or {}).get(
+                    "gemma4_e2b_h512_dense_bridge_pair"
+                )
+            )
+            for stats in batch8_decode_stats
+        )
+    )
+    dense_bridge_enabled = bool(
+        batch8_decode_stats
+        and all(
+            stats.get("gemma4_dense_attn_mlp_bridge_decode_enabled")
+            for stats in batch8_decode_stats
+        )
+    )
+    dense_bridge_hits = _max_counter(
+        batch8_decode_stats,
+        "gemma4_dense_attn_mlp_bridge_decode_hits",
+    )
+    dense_bridge_disabled = any(
+        stats.get("gemma4_dense_attn_mlp_bridge_runtime_disabled")
+        for stats in batch8_decode_stats
+    )
+    dense_bridge_failures = sorted(
+        {
+            str(stats.get("gemma4_dense_attn_mlp_bridge_failure"))
+            for stats in batch8_decode_stats
+            if stats.get("gemma4_dense_attn_mlp_bridge_failure")
+        }
+    )
+    h512_grouped_hits = _max_counter(
+        batch8_paged_stats,
+        "grouped_segmented_hits",
+    )
+    h512_segments = sorted(
+        {
+            int(
+                (stats.get("grouped_segmented_selected_segments") or {}).get(
+                    "e2b_l4_full_h512_gqa8", 0
+                )
+                or 0
+            )
+            for stats in batch8_paged_stats
+        }
+    )
+    h512_tiles = sorted(
+        {
+            int(
+                (stats.get("grouped_segmented_selected_tile_sizes") or {}).get(
+                    "e2b_l4_full_h512_gqa8", 0
+                )
+                or 0
+            )
+            for stats in batch8_paged_stats
+        }
+    )
+    h512_grouped_disabled = any(
+        stats.get("grouped_segmented_disabled") for stats in batch8_paged_stats
+    )
+    h512_grouped_failures = sorted(
+        {
+            str(stats.get("grouped_segmented_failure"))
+            for stats in batch8_paged_stats
+            if stats.get("grouped_segmented_failure")
+        }
+    )
+    if e2b_h512_dense_bridge_pair_applicable:
+        if not pair_policy_enabled:
+            errors.append("E2B L4 H512+dense-bridge pair policy was not enabled")
+        if not dense_bridge_enabled or dense_bridge_hits <= 0:
+            errors.append("E2B L4 dense attention-to-MLP bridge was not exercised")
+        if dense_bridge_disabled or dense_bridge_failures:
+            errors.append(
+                "E2B L4 dense bridge disabled itself: "
+                + "; ".join(dense_bridge_failures or ["unspecified"])
+            )
+        if h512_grouped_hits <= 0:
+            errors.append("E2B L4 grouped full-H512 attention was not exercised")
+        if h512_segments != [32] or h512_tiles != [16]:
+            errors.append(
+                "E2B L4 H512 launch does not match promoted segments/tile: "
+                f"segments={h512_segments!r}, tiles={h512_tiles!r}"
+            )
+        if h512_grouped_disabled or h512_grouped_failures:
+            errors.append(
+                "E2B L4 grouped H512 attention disabled itself: "
+                + "; ".join(h512_grouped_failures or ["unspecified"])
+            )
     fused_gateup_policy_rows = sorted(
         {
             tuple(int(value) for value in stats.get(
@@ -777,6 +890,18 @@ def audit_gemma4_dense_fast_path(path: Path, profile: str) -> dict:
             ],
             "batch8_fused_gateup_hits": batch8_fused_gateup_hits,
             "batch8_deepfusion_hits": batch8_deepfusion_hits,
+            "e2b_h512_dense_bridge_pair_required": (
+                require_e2b_h512_dense_bridge_pair
+            ),
+            "e2b_h512_dense_bridge_pair_applicable": (
+                e2b_h512_dense_bridge_pair_applicable
+            ),
+            "e2b_h512_dense_bridge_pair_policy_enabled": pair_policy_enabled,
+            "e2b_h512_grouped_attention_hits": h512_grouped_hits,
+            "e2b_h512_grouped_attention_segments": h512_segments,
+            "e2b_h512_grouped_attention_tiles": h512_tiles,
+            "e2b_dense_attn_mlp_bridge_enabled": dense_bridge_enabled,
+            "e2b_dense_attn_mlp_bridge_hits": dense_bridge_hits,
             "e2b_l4_sliding_prefill_required": require_e2b_l4_sliding_prefill,
             "e2b_l4_sliding_prefill_applicable": (
                 e2b_l4_sliding_prefill_applicable
@@ -820,6 +945,8 @@ def audit_gemma4_dense_fast_path(path: Path, profile: str) -> dict:
             "gemma4_dense_next_attn_norm": _max_counter(
                 decode_stats, "gemma4_dense_next_attn_norm_decode_hits"
             ),
+            "gemma4_dense_attn_mlp_bridge": dense_bridge_hits,
+            "gemma4_e2b_h512_grouped_attention": h512_grouped_hits,
             "gemma4_fused_dual_ffn_norm_prefill": _max_counter(
                 decode_stats, "gemma4_fused_dual_ffn_norm_prefill_hits"
             ),

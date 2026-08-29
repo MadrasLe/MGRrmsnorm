@@ -126,6 +126,7 @@ try:
     from ..kernels.rmsnorm_triton import (
         rmsnorm_triton,
         rmsnorm_triton_add,
+        rmsnorm_triton_attn_residual_dense,
         rmsnorm_triton_attn_residual_dual,
         rmsnorm_triton_attn_residual_router_bridge,
         rmsnorm_triton_attn_residual_router_bridge_single,
@@ -141,6 +142,7 @@ try:
 except Exception:
     rmsnorm_triton = None
     rmsnorm_triton_add = None
+    rmsnorm_triton_attn_residual_dense = None
     rmsnorm_triton_attn_residual_dual = None
     rmsnorm_triton_attn_residual_router_bridge = None
     rmsnorm_triton_attn_residual_router_bridge_single = None
@@ -179,11 +181,15 @@ except Exception:
     _HAS_TRITON_SWIGLU = False
 try:
     from ..kernels.mlp_prefill_native import (
+        cublaslt_bf16_linear_cuda,
         mlp_prefill_forward_cuda as native_mlp_prefill_forward_cuda,
+        HAS_CUBLASLT_BF16_LINEAR,
         HAS_NATIVE_MLP_PREFILL,
     )
 except Exception:
+    cublaslt_bf16_linear_cuda = None
     native_mlp_prefill_forward_cuda = None
+    HAS_CUBLASLT_BF16_LINEAR = False
     HAS_NATIVE_MLP_PREFILL = False
 
 # Try decode DeepFusion MLP (SwiGLU + down_proj fused)
@@ -658,6 +664,16 @@ _GEMMA4_DEEPFUSION_MLP_DECODE = _env_enabled(
 _GEMMA4_DENSE_POST_NORM_CHAIN_DECODE = _env_enabled(
     # Experimental until a same-session E2B/E4B L4 A/B proves wall-time gain.
     "MEGAGEMM_GEMMA4_DENSE_POST_NORM_CHAIN_DECODE", default=False
+)
+_GEMMA4_DENSE_ATTN_MLP_BRIDGE_DECODE = _env_enabled(
+    # Experimental E2B/L4/BF16/B8 candidate.  It must pass both the exact
+    # bridge microgate and a same-session full-model A/B before promotion.
+    "MEGAGEMM_GEMMA4_DENSE_ATTN_MLP_BRIDGE_DECODE", default=False
+)
+_GEMMA4_E2B_CUBLASLT_GATEUP_DECODE = _env_enabled(
+    # Experimental explicit-algorithm BF16 path.  The native micro-sweep must
+    # provide both N=12288 and N=24576 indices; otherwise torch.mm is retained.
+    "MEGAGEMM_GEMMA4_E2B_CUBLASLT_GATEUP_DECODE", default=False
 )
 _GEMMA4_PLE_CONDITIONED_GELU_DECODE = _env_enabled(
     # Experimental until the E2B/L4/BF16/B8 full-model A/B gate passes.
@@ -10845,6 +10861,16 @@ class MegaGemmLlama(nn.Module):
         self._gemma4_flat_dense_post_norm_chain_hits = 0
         self._gemma4_flat_dense_next_attn_norm_hits = 0
         self._gemma4_flat_dense_next_attn_norm_bufs = None
+        self._gemma4_flat_dense_attn_mlp_bridge_enabled = False
+        self._gemma4_flat_dense_attn_mlp_bridge_hits = 0
+        self._gemma4_flat_dense_attn_mlp_bridge_runtime_disabled = False
+        self._gemma4_flat_dense_attn_mlp_bridge_failure = ""
+        self._gemma4_flat_dense_attn_mlp_input_bufs = None
+        self._gemma4_flat_cublaslt_gateup_enabled = False
+        self._gemma4_flat_cublaslt_gateup_hits = 0
+        self._gemma4_flat_cublaslt_gateup_runtime_disabled = False
+        self._gemma4_flat_cublaslt_gateup_failure = ""
+        self._gemma4_flat_cublaslt_gateup_algorithms = {}
         self._gemma4_flat_policy_fused_gateup_rows = ()
         self._gemma4_flat_policy_deepfusion_rows = ()
         self._gemma4_flat_policy_cublas_gateup_rows = ()
@@ -13993,6 +14019,25 @@ class MegaGemmLlama(nn.Module):
             "gemma4_policy_bf16_cublas_down_rows": list(
                 getattr(self, "_gemma4_flat_policy_cublas_down_rows", ())
             ),
+            "gemma4_cublaslt_gateup_decode_enabled": bool(
+                getattr(self, "_gemma4_flat_cublaslt_gateup_enabled", False)
+            ),
+            "gemma4_cublaslt_gateup_decode_hits": int(
+                getattr(self, "_gemma4_flat_cublaslt_gateup_hits", 0)
+            ),
+            "gemma4_cublaslt_gateup_algorithms": dict(
+                getattr(self, "_gemma4_flat_cublaslt_gateup_algorithms", {})
+            ),
+            "gemma4_cublaslt_gateup_runtime_disabled": bool(
+                getattr(
+                    self,
+                    "_gemma4_flat_cublaslt_gateup_runtime_disabled",
+                    False,
+                )
+            ),
+            "gemma4_cublaslt_gateup_failure": str(
+                getattr(self, "_gemma4_flat_cublaslt_gateup_failure", "")
+            ),
             "gemma4_dense_post_norm_chain_decode_enabled": bool(
                 getattr(
                     self,
@@ -14005,6 +14050,30 @@ class MegaGemmLlama(nn.Module):
             ),
             "gemma4_dense_next_attn_norm_decode_hits": int(
                 getattr(self, "_gemma4_flat_dense_next_attn_norm_hits", 0)
+            ),
+            "gemma4_dense_attn_mlp_bridge_decode_enabled": bool(
+                getattr(
+                    self,
+                    "_gemma4_flat_dense_attn_mlp_bridge_enabled",
+                    False,
+                )
+            ),
+            "gemma4_dense_attn_mlp_bridge_decode_hits": int(
+                getattr(self, "_gemma4_flat_dense_attn_mlp_bridge_hits", 0)
+            ),
+            "gemma4_dense_attn_mlp_bridge_runtime_disabled": bool(
+                getattr(
+                    self,
+                    "_gemma4_flat_dense_attn_mlp_bridge_runtime_disabled",
+                    False,
+                )
+            ),
+            "gemma4_dense_attn_mlp_bridge_failure": str(
+                getattr(
+                    self,
+                    "_gemma4_flat_dense_attn_mlp_bridge_failure",
+                    "",
+                )
             ),
             "gemma4_parallel_moe_decode_enabled": bool(
                 getattr(self, "_gemma4_flat_parallel_moe_enabled", False)
@@ -16088,6 +16157,67 @@ class MegaGemmLlama(nn.Module):
                     for lw in weights
                 )
             )
+            dense_attn_mlp_bridge_requested = policy_bool(
+                self,
+                "MEGAGEMM_GEMMA4_DENSE_ATTN_MLP_BRIDGE_DECODE",
+                "gemma4_e2b_h512_dense_bridge_pair",
+                default=_GEMMA4_DENSE_ATTN_MLP_BRIDGE_DECODE,
+            )
+            self._gemma4_flat_dense_attn_mlp_bridge_enabled = bool(
+                dense_attn_mlp_bridge_requested
+                and callable(rmsnorm_triton_attn_residual_dense)
+                and self.runtime_policy.name == "gemma4-e2b-l4"
+                and int(batch_size) == 8
+                and dtype == torch.bfloat16
+                and not bool(self._flat_norm_offset)
+                and all(not lw.is_moe for lw in weights)
+            )
+            self._gemma4_flat_dense_attn_mlp_input_bufs = (
+                [
+                    torch.empty(
+                        batch_size,
+                        self._flat_hidden_size,
+                        device=device,
+                        dtype=dtype,
+                    )
+                    for _ in weights
+                ]
+                if self._gemma4_flat_dense_attn_mlp_bridge_enabled
+                else None
+            )
+            cublaslt_gateup_algorithms = {
+                12288: _env_int(
+                    "MEGAGEMM_GEMMA4_E2B_CUBLASLT_GATEUP_N12288_ALGO",
+                    -1,
+                ),
+                24576: _env_int(
+                    "MEGAGEMM_GEMMA4_E2B_CUBLASLT_GATEUP_N24576_ALGO",
+                    -1,
+                ),
+            }
+            self._gemma4_flat_cublaslt_gateup_enabled = bool(
+                _GEMMA4_E2B_CUBLASLT_GATEUP_DECODE
+                and HAS_CUBLASLT_BF16_LINEAR
+                and callable(cublaslt_bf16_linear_cuda)
+                and self.runtime_policy.name == "gemma4-e2b-l4"
+                and int(batch_size) == 8
+                and dtype == torch.bfloat16
+                and all(
+                    int(lw.gate_up_weight.shape[0])
+                    in cublaslt_gateup_algorithms
+                    and cublaslt_gateup_algorithms[
+                        int(lw.gate_up_weight.shape[0])
+                    ]
+                    >= 0
+                    for lw in weights
+                    if lw.gate_up_weight is not None
+                )
+            )
+            self._gemma4_flat_cublaslt_gateup_algorithms = (
+                dict(cublaslt_gateup_algorithms)
+                if self._gemma4_flat_cublaslt_gateup_enabled
+                else {}
+            )
             ple_conditioned_gelu_requested = policy_bool(
                 self,
                 "MEGAGEMM_GEMMA4_PLE_CONDITIONED_GELU_DECODE",
@@ -16257,6 +16387,12 @@ class MegaGemmLlama(nn.Module):
             self._gemma4_flat_fused_layer_scalar_hits = 0
             self._gemma4_flat_dense_post_norm_chain_hits = 0
             self._gemma4_flat_dense_next_attn_norm_hits = 0
+            self._gemma4_flat_dense_attn_mlp_bridge_hits = 0
+            self._gemma4_flat_dense_attn_mlp_bridge_runtime_disabled = False
+            self._gemma4_flat_dense_attn_mlp_bridge_failure = ""
+            self._gemma4_flat_cublaslt_gateup_hits = 0
+            self._gemma4_flat_cublaslt_gateup_runtime_disabled = False
+            self._gemma4_flat_cublaslt_gateup_failure = ""
             self._gemma4_flat_fused_router_expert_input_norm_hits = 0
             if self._gemma4_flat_parallel_moe_enabled:
                 self._gemma4_flat_parallel_moe_stream = torch.cuda.Stream(device=device)
@@ -16813,26 +16949,57 @@ class MegaGemmLlama(nn.Module):
                     "mlp_input_norm",
                     mlp_input_norm_start_end,
                 )
-            if lw.gate_up_wt is not None:
-                gate_up = self._flat_fp_linear(
-                    mlp_in,
-                    lw.gate_up_wt,
-                    lw.gate_up_bias,
-                    self._gemma4_flat_gate_up_bufs[layer_idx],
-                )
-            elif int8_inline and lw.gate_up_int8_w is not None:
-                gate_up = _flat_int8_linear(
-                    mlp_in,
-                    lw.gate_up_int8_w,
-                    lw.gate_up_int8_scale,
-                    lw.gate_up_bias,
-                    self._flat_int8_x_buf,
-                    self._flat_int8_scale_buf,
-                    self._flat_int8_quant_block_h,
-                    out=self._gemma4_flat_gate_up_bufs[layer_idx],
-                )
-            else:
-                gate_up = lw.gate_up_mod(mlp_in)
+            use_cublaslt_gateup = bool(
+                self._gemma4_flat_cublaslt_gateup_enabled
+                and not self._gemma4_flat_cublaslt_gateup_runtime_disabled
+                and lw.gate_up_weight is not None
+                and int(lw.gate_up_weight.shape[0])
+                in self._gemma4_flat_cublaslt_gateup_algorithms
+            )
+            gate_up = None
+            if use_cublaslt_gateup:
+                try:
+                    gate_up = cublaslt_bf16_linear_cuda(
+                        mlp_in,
+                        lw.gate_up_weight,
+                        lw.gate_up_bias,
+                        out=self._gemma4_flat_gate_up_bufs[layer_idx],
+                        algorithm_index=(
+                            self._gemma4_flat_cublaslt_gateup_algorithms[
+                                int(lw.gate_up_weight.shape[0])
+                            ]
+                        ),
+                    )
+                except Exception as exc:
+                    self._gemma4_flat_cublaslt_gateup_runtime_disabled = True
+                    if not self._gemma4_flat_cublaslt_gateup_failure:
+                        self._gemma4_flat_cublaslt_gateup_failure = (
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                    gate_up = None
+                else:
+                    self._gemma4_flat_cublaslt_gateup_hits += 1
+            if gate_up is None:
+                if lw.gate_up_wt is not None:
+                    gate_up = self._flat_fp_linear(
+                        mlp_in,
+                        lw.gate_up_wt,
+                        lw.gate_up_bias,
+                        self._gemma4_flat_gate_up_bufs[layer_idx],
+                    )
+                elif int8_inline and lw.gate_up_int8_w is not None:
+                    gate_up = _flat_int8_linear(
+                        mlp_in,
+                        lw.gate_up_int8_w,
+                        lw.gate_up_int8_scale,
+                        lw.gate_up_bias,
+                        self._flat_int8_x_buf,
+                        self._flat_int8_scale_buf,
+                        self._flat_int8_quant_block_h,
+                        out=self._gemma4_flat_gate_up_bufs[layer_idx],
+                    )
+                else:
+                    gate_up = lw.gate_up_mod(mlp_in)
         _timing_record_end(timing_events, "mlp_gate_up", mlp_gate_up_start_end)
 
         mlp_down_start_end = _timing_record_start(timing_events is not None)
@@ -17083,6 +17250,14 @@ class MegaGemmLlama(nn.Module):
                         if int(lw.head_dim) == 256
                         else None
                     ),
+                    e2b_l4_h512_policy_enabled=bool(
+                        getattr(
+                            self.runtime_policy,
+                            "gemma4_e2b_h512_dense_bridge_pair",
+                            False,
+                        )
+                        and self._gemma4_flat_dense_attn_mlp_bridge_enabled
+                    ),
                 )
                 _timing_record_end(timing_events, "attn_core", attn_core_start_end)
                 if timing_events is not None and attn_core_start_end is not None and attn_core_start_end[0] is not None:
@@ -17171,6 +17346,7 @@ class MegaGemmLlama(nn.Module):
             bridge_shared_in = None
             bridge_expert_in = None
             bridge_router_in = None
+            bridge_dense_in = None
             use_attn_moe_bridge = bool(
                 timing_events is None
                 and lw.is_moe
@@ -17261,6 +17437,46 @@ class MegaGemmLlama(nn.Module):
                         expert_out=self._gemma4_flat_expert_input_bufs[layer_idx],
                     )
                 self._gemma4_flat_fused_attn_moe_bridge_hits += 1
+            elif (
+                timing_events is None
+                and not lw.is_moe
+                and int(bsz) == 8
+                and self._gemma4_flat_dense_attn_mlp_bridge_enabled
+                and not self._gemma4_flat_dense_attn_mlp_bridge_runtime_disabled
+            ):
+                try:
+                    hidden, bridge_dense_in = (
+                        rmsnorm_triton_attn_residual_dense(
+                            o_out,
+                            residual,
+                            lw.post_attn_norm_weight,
+                            lw.pre_ff_norm_weight,
+                            norm_eps,
+                            norm_offset=norm_offset,
+                            out_hidden=residual,
+                            pre_ff_out=(
+                                self._gemma4_flat_dense_attn_mlp_input_bufs[
+                                    layer_idx
+                                ]
+                            ),
+                        )
+                    )
+                except Exception as exc:
+                    self._gemma4_flat_dense_attn_mlp_bridge_runtime_disabled = True
+                    if not self._gemma4_flat_dense_attn_mlp_bridge_failure:
+                        self._gemma4_flat_dense_attn_mlp_bridge_failure = (
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                else:
+                    self._gemma4_flat_dense_attn_mlp_bridge_hits += 1
+                if bridge_dense_in is None:
+                    attn_normed = self._gemma4_flat_rmsnorm(
+                        o_out,
+                        lw.post_attn_norm_weight,
+                        norm_eps,
+                        norm_offset,
+                    )
+                    hidden = residual.add_(attn_normed)
             else:
                 attn_output_norm_start_end = _timing_record_start(
                     timing_events is not None
@@ -17388,7 +17604,11 @@ class MegaGemmLlama(nn.Module):
                 _timing_record_end(timing_events, "moe_router", moe_router_start_end)
             if not parallel_moe:
                 down_out = self._gemma4_flat_shared_mlp_decode(
-                    hidden, lw, layer_idx, timing_events
+                    hidden,
+                    lw,
+                    layer_idx,
+                    timing_events,
+                    normalized_input=bridge_dense_in,
                 )
             if lw.is_moe:
                 mlp_output_norm_start_end = _timing_record_start(timing_events is not None)

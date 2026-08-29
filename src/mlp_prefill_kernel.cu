@@ -4,10 +4,13 @@
 #include <cublasLt.h>
 #include <cuda_fp16.h>
 #include <torch/extension.h>
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <unordered_map>
 #include <mutex>
+#include <memory>
+#include <vector>
 
 #define CHECK_CUDA(x) TORCH_CHECK(x.device().is_cuda(), #x " must be a CUDA tensor")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
@@ -70,6 +73,65 @@ std::mutex& get_algo_cache_mutex() {
     return mu;
 }
 
+struct LtBf16PlanKey {
+    int64_t m;
+    int64_t n;
+    int64_t k;
+    int device;
+    int algorithm_index;
+    bool operator==(const LtBf16PlanKey& other) const {
+        return m == other.m && n == other.n && k == other.k &&
+            device == other.device && algorithm_index == other.algorithm_index;
+    }
+};
+
+struct LtBf16PlanKeyHash {
+    size_t operator()(const LtBf16PlanKey& key) const {
+        size_t h = static_cast<size_t>(key.m);
+        h = (h * 1315423911u) ^ static_cast<size_t>(key.n);
+        h = (h * 1315423911u) ^ static_cast<size_t>(key.k);
+        h = (h * 1315423911u) ^ static_cast<size_t>(key.device);
+        h = (h * 1315423911u) ^ static_cast<size_t>(key.algorithm_index);
+        return h;
+    }
+};
+
+struct LtBf16Plan {
+    cublasLtMatmulDesc_t op_desc = nullptr;
+    cublasLtMatrixLayout_t a_layout = nullptr;
+    cublasLtMatrixLayout_t b_layout = nullptr;
+    cublasLtMatrixLayout_t c_layout = nullptr;
+    cublasLtMatmulPreference_t preference = nullptr;
+    cublasLtMatmulHeuristicResult_t heuristic{};
+    int heuristic_count = 0;
+
+    ~LtBf16Plan() {
+        if (preference != nullptr) cublasLtMatmulPreferenceDestroy(preference);
+        if (c_layout != nullptr) cublasLtMatrixLayoutDestroy(c_layout);
+        if (b_layout != nullptr) cublasLtMatrixLayoutDestroy(b_layout);
+        if (a_layout != nullptr) cublasLtMatrixLayoutDestroy(a_layout);
+        if (op_desc != nullptr) cublasLtMatmulDescDestroy(op_desc);
+    }
+};
+
+std::unordered_map<
+    LtBf16PlanKey,
+    std::unique_ptr<LtBf16Plan>,
+    LtBf16PlanKeyHash
+>& get_bf16_plan_cache() {
+    static std::unordered_map<
+        LtBf16PlanKey,
+        std::unique_ptr<LtBf16Plan>,
+        LtBf16PlanKeyHash
+    > cache;
+    return cache;
+}
+
+std::mutex& get_bf16_plan_cache_mutex() {
+    static std::mutex mu;
+    return mu;
+}
+
 void* get_lt_workspace(int device) {
     static std::mutex mu;
     static void* workspace = nullptr;
@@ -107,6 +169,118 @@ void set_row_major(cublasLtMatrixLayout_t layout) {
         &order,
         sizeof(order)
     ));
+}
+
+std::unique_ptr<LtBf16Plan> make_bf16_plan(
+    int64_t m,
+    int64_t n,
+    int64_t k,
+    int algorithm_index
+) {
+    TORCH_CHECK(algorithm_index >= 0, "cuBLASLt algorithm index must be non-negative");
+    auto plan = std::make_unique<LtBf16Plan>();
+    cublasOperation_t trans_a = CUBLAS_OP_N;
+    cublasOperation_t trans_b = CUBLAS_OP_T;
+    CHECK_CUBLASLT(cublasLtMatmulDescCreate(
+        &plan->op_desc,
+        CUBLAS_COMPUTE_32F,
+        CUDA_R_32F
+    ));
+    CHECK_CUBLASLT(cublasLtMatmulDescSetAttribute(
+        plan->op_desc,
+        CUBLASLT_MATMUL_DESC_TRANSA,
+        &trans_a,
+        sizeof(trans_a)
+    ));
+    CHECK_CUBLASLT(cublasLtMatmulDescSetAttribute(
+        plan->op_desc,
+        CUBLASLT_MATMUL_DESC_TRANSB,
+        &trans_b,
+        sizeof(trans_b)
+    ));
+    CHECK_CUBLASLT(cublasLtMatrixLayoutCreate(
+        &plan->a_layout,
+        CUDA_R_16BF,
+        m,
+        k,
+        k
+    ));
+    CHECK_CUBLASLT(cublasLtMatrixLayoutCreate(
+        &plan->b_layout,
+        CUDA_R_16BF,
+        n,
+        k,
+        k
+    ));
+    CHECK_CUBLASLT(cublasLtMatrixLayoutCreate(
+        &plan->c_layout,
+        CUDA_R_16BF,
+        m,
+        n,
+        n
+    ));
+    set_row_major(plan->a_layout);
+    set_row_major(plan->b_layout);
+    set_row_major(plan->c_layout);
+    CHECK_CUBLASLT(cublasLtMatmulPreferenceCreate(&plan->preference));
+    CHECK_CUBLASLT(cublasLtMatmulPreferenceSetAttribute(
+        plan->preference,
+        CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+        &kLtWorkspaceBytes,
+        sizeof(kLtWorkspaceBytes)
+    ));
+
+    constexpr int kMaximumHeuristics = 32;
+    std::vector<cublasLtMatmulHeuristicResult_t> heuristics(
+        kMaximumHeuristics
+    );
+    int returned_results = 0;
+    CHECK_CUBLASLT(cublasLtMatmulAlgoGetHeuristic(
+        get_lt_state().handle,
+        plan->op_desc,
+        plan->a_layout,
+        plan->b_layout,
+        plan->c_layout,
+        plan->c_layout,
+        plan->preference,
+        kMaximumHeuristics,
+        heuristics.data(),
+        &returned_results
+    ));
+    plan->heuristic_count = returned_results;
+    TORCH_CHECK(
+        algorithm_index < returned_results,
+        "cuBLASLt BF16 algorithm index ",
+        algorithm_index,
+        " is unavailable; heuristic count is ",
+        returned_results
+    );
+    plan->heuristic = heuristics[algorithm_index];
+    TORCH_CHECK(
+        plan->heuristic.state == CUBLAS_STATUS_SUCCESS,
+        "cuBLASLt BF16 heuristic is not executable"
+    );
+    return plan;
+}
+
+LtBf16Plan* get_bf16_plan(
+    int64_t m,
+    int64_t n,
+    int64_t k,
+    int device,
+    int algorithm_index
+) {
+    const LtBf16PlanKey key{m, n, k, device, algorithm_index};
+    std::lock_guard<std::mutex> lock(get_bf16_plan_cache_mutex());
+    auto& cache = get_bf16_plan_cache();
+    auto it = cache.find(key);
+    if (it == cache.end()) {
+        it = cache.emplace(
+            key,
+            make_bf16_plan(m, n, k, algorithm_index)
+        ).first;
+    }
+    return it->second.get();
 }
 
 bool use_fused_swiglu_down_kernel() {
@@ -362,6 +536,138 @@ __global__ void swiglu_forward_fp16_kernel(
 }
 
 }  // namespace
+
+
+int64_t cublaslt_bf16_algorithm_count_cuda(
+    torch::Tensor input,
+    torch::Tensor weight,
+    int64_t maximum_algorithms
+) {
+    CHECK_INPUT(input);
+    CHECK_INPUT(weight);
+    TORCH_CHECK(input.dim() == 2, "BF16 cuBLASLt input must be [M, K]");
+    TORCH_CHECK(weight.dim() == 2, "BF16 cuBLASLt weight must be [N, K]");
+    TORCH_CHECK(
+        input.scalar_type() == torch::kBFloat16 &&
+            weight.scalar_type() == torch::kBFloat16,
+        "BF16 cuBLASLt algorithm search requires bfloat16 tensors"
+    );
+    TORCH_CHECK(
+        input.device() == weight.device(),
+        "BF16 cuBLASLt input and weight must be on the same device"
+    );
+    TORCH_CHECK(
+        input.size(1) == weight.size(1),
+        "BF16 cuBLASLt inner dimensions must match"
+    );
+    TORCH_CHECK(maximum_algorithms > 0, "maximum_algorithms must be positive");
+    LtBf16Plan* plan = get_bf16_plan(
+        input.size(0),
+        weight.size(0),
+        input.size(1),
+        static_cast<int>(input.get_device()),
+        0
+    );
+    return std::min<int64_t>(
+        maximum_algorithms,
+        static_cast<int64_t>(plan->heuristic_count)
+    );
+}
+
+
+torch::Tensor cublaslt_bf16_linear_cuda(
+    torch::Tensor input,
+    torch::Tensor weight,
+    c10::optional<torch::Tensor> bias,
+    c10::optional<torch::Tensor> out,
+    int64_t algorithm_index
+) {
+    CHECK_INPUT(input);
+    CHECK_INPUT(weight);
+    TORCH_CHECK(input.dim() == 2, "BF16 cuBLASLt input must be [M, K]");
+    TORCH_CHECK(weight.dim() == 2, "BF16 cuBLASLt weight must be [N, K]");
+    TORCH_CHECK(
+        input.scalar_type() == torch::kBFloat16 &&
+            weight.scalar_type() == torch::kBFloat16,
+        "BF16 cuBLASLt linear requires bfloat16 tensors"
+    );
+    TORCH_CHECK(
+        input.device() == weight.device(),
+        "BF16 cuBLASLt input and weight must be on the same device"
+    );
+    TORCH_CHECK(
+        input.size(1) == weight.size(1),
+        "BF16 cuBLASLt computes input @ weight.T; K dimensions must match"
+    );
+    TORCH_CHECK(
+        algorithm_index >= 0 && algorithm_index < 32,
+        "BF16 cuBLASLt algorithm index must be in [0, 31]"
+    );
+
+    const int64_t m = input.size(0);
+    const int64_t n = weight.size(0);
+    const int64_t k = input.size(1);
+    torch::Tensor output;
+    if (out.has_value()) {
+        output = out.value();
+        CHECK_INPUT(output);
+        TORCH_CHECK(
+            output.scalar_type() == torch::kBFloat16,
+            "BF16 cuBLASLt output must be bfloat16"
+        );
+        TORCH_CHECK(
+            output.device() == input.device(),
+            "BF16 cuBLASLt output must be on the input device"
+        );
+        TORCH_CHECK(
+            output.dim() == 2 && output.size(0) == m && output.size(1) == n,
+            "BF16 cuBLASLt output must have shape [M, N]"
+        );
+    } else {
+        output = torch::empty({m, n}, input.options());
+    }
+    if (bias.has_value()) {
+        CHECK_INPUT(bias.value());
+        TORCH_CHECK(
+            bias.value().scalar_type() == torch::kBFloat16 &&
+                bias.value().device() == input.device() &&
+                bias.value().dim() == 1 && bias.value().size(0) == n,
+            "BF16 cuBLASLt bias must be a contiguous bfloat16 [N] tensor"
+        );
+    }
+
+    LtBf16Plan* plan = get_bf16_plan(
+        m,
+        n,
+        k,
+        static_cast<int>(input.get_device()),
+        static_cast<int>(algorithm_index)
+    );
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    CHECK_CUBLASLT(cublasLtMatmul(
+        get_lt_state().handle,
+        plan->op_desc,
+        &alpha,
+        input.data_ptr<at::BFloat16>(),
+        plan->a_layout,
+        weight.data_ptr<at::BFloat16>(),
+        plan->b_layout,
+        &beta,
+        output.data_ptr<at::BFloat16>(),
+        plan->c_layout,
+        output.data_ptr<at::BFloat16>(),
+        plan->c_layout,
+        &plan->heuristic.algo,
+        get_lt_workspace(static_cast<int>(input.get_device())),
+        kLtWorkspaceBytes,
+        at::cuda::getCurrentCUDAStream()
+    ));
+    if (bias.has_value()) {
+        output.add_(bias.value());
+    }
+    return output;
+}
 
 
 torch::Tensor swiglu_forward_cuda(torch::Tensor input, int64_t hidden_dim) {

@@ -10,6 +10,47 @@ HAS_NATIVE_MLP_PREFILL = bool(
     _cuda_ops is not None
     and hasattr(_cuda_ops, "mlp_prefill_forward_cuda")
 )
+HAS_CUBLASLT_BF16_LINEAR = bool(
+    _cuda_ops is not None
+    and hasattr(_cuda_ops, "cublaslt_bf16_algorithm_count_cuda")
+    and hasattr(_cuda_ops, "cublaslt_bf16_linear_cuda")
+)
+
+
+def cublaslt_bf16_algorithm_count_cuda(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    maximum_algorithms: int = 32,
+) -> int:
+    if not HAS_CUBLASLT_BF16_LINEAR:
+        raise RuntimeError("native cuBLASLt BF16 linear op is unavailable")
+    return int(
+        _cuda_ops.cublaslt_bf16_algorithm_count_cuda(
+            x,
+            weight,
+            int(maximum_algorithms),
+        )
+    )
+
+
+def cublaslt_bf16_linear_cuda(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    *,
+    out: torch.Tensor | None = None,
+    algorithm_index: int = 0,
+) -> torch.Tensor:
+    """Compute ``x @ weight.T`` with one explicit cuBLASLt heuristic."""
+    if not HAS_CUBLASLT_BF16_LINEAR:
+        raise RuntimeError("native cuBLASLt BF16 linear op is unavailable")
+    return _cuda_ops.cublaslt_bf16_linear_cuda(
+        x,
+        weight,
+        bias,
+        out,
+        int(algorithm_index),
+    )
 
 
 def mlp_prefill_forward_cuda(
