@@ -167,9 +167,14 @@ _USE_EXPERIMENTAL_TRITON_OFFSET_RMSNORM = os.environ.get(
 
 # Try MegaGemm Triton SwiGLU
 try:
-    from ..kernels.swiglu import MegaGemmFunction, swiglu_forward
+    from ..kernels.swiglu import (
+        MegaGemmFunction,
+        conditioned_gelu_tanh_forward,
+        swiglu_forward,
+    )
     _HAS_TRITON_SWIGLU = True
 except Exception:
+    conditioned_gelu_tanh_forward = None
     swiglu_forward = None
     _HAS_TRITON_SWIGLU = False
 try:
@@ -653,6 +658,10 @@ _GEMMA4_DEEPFUSION_MLP_DECODE = _env_enabled(
 _GEMMA4_DENSE_POST_NORM_CHAIN_DECODE = _env_enabled(
     # Experimental until a same-session E2B/E4B L4 A/B proves wall-time gain.
     "MEGAGEMM_GEMMA4_DENSE_POST_NORM_CHAIN_DECODE", default=False
+)
+_GEMMA4_PLE_CONDITIONED_GELU_DECODE = _env_enabled(
+    # Experimental until the E2B/L4/BF16/B8 full-model A/B gate passes.
+    "MEGAGEMM_GEMMA4_PLE_CONDITIONED_GELU_DECODE", default=False
 )
 _GEMMA4_PARALLEL_MOE_DECODE = _env_enabled(
     "MEGAGEMM_GEMMA4_PARALLEL_MOE_DECODE", default=True
@@ -13948,6 +13957,30 @@ class MegaGemmLlama(nn.Module):
             "gemma4_flat_fused_gateup_runtime_disabled": bool(
                 getattr(self, "_gemma4_flat_fused_gateup_runtime_disabled", False)
             ),
+            "gemma4_ple_conditioned_gelu_decode_enabled": bool(
+                getattr(
+                    self,
+                    "_gemma4_flat_ple_conditioned_gelu_enabled",
+                    False,
+                )
+            ),
+            "gemma4_ple_conditioned_gelu_decode_hits": int(
+                getattr(self, "_gemma4_flat_ple_conditioned_gelu_hits", 0)
+            ),
+            "gemma4_ple_conditioned_gelu_runtime_disabled": bool(
+                getattr(
+                    self,
+                    "_gemma4_flat_ple_conditioned_gelu_runtime_disabled",
+                    False,
+                )
+            ),
+            "gemma4_ple_conditioned_gelu_first_failure": str(
+                getattr(
+                    self,
+                    "_gemma4_flat_ple_conditioned_gelu_first_failure",
+                    "",
+                )
+            ),
             "gemma4_flat_deepfusion_hits": int(
                 getattr(self, "_gemma4_flat_deepfusion_hits", 0)
             ),
@@ -15493,6 +15526,9 @@ class MegaGemmLlama(nn.Module):
             )
             self._gemma4_flat_fused_gateup_runtime_disabled = False
             self._gemma4_flat_fused_gateup_hits = 0
+            self._gemma4_flat_ple_conditioned_gelu_hits = 0
+            self._gemma4_flat_ple_conditioned_gelu_runtime_disabled = False
+            self._gemma4_flat_ple_conditioned_gelu_first_failure = ""
             self._gemma4_flat_deepfusion_hits = 0
             self._gemma4_mlp_fusion_debug_seen = set()
             self._flat_int8_inline = False
@@ -16051,6 +16087,21 @@ class MegaGemmLlama(nn.Module):
                     not lw.is_moe and int(lw.layer_scalar.numel()) == 1
                     for lw in weights
                 )
+            )
+            ple_conditioned_gelu_requested = policy_bool(
+                self,
+                "MEGAGEMM_GEMMA4_PLE_CONDITIONED_GELU_DECODE",
+                "gemma4_ple_conditioned_gelu_decode",
+                default=_GEMMA4_PLE_CONDITIONED_GELU_DECODE,
+            )
+            self._gemma4_flat_ple_conditioned_gelu_enabled = bool(
+                ple_conditioned_gelu_requested
+                and callable(conditioned_gelu_tanh_forward)
+                and self.runtime_policy.name == "gemma4-e2b-l4"
+                and int(batch_size) == 8
+                and dtype == torch.bfloat16
+                and int(self.hidden_size_per_layer_input) == 256
+                and all(int(lw.ple_size) == 256 for lw in weights)
             )
             self._gemma4_flat_dense_next_attn_norm_bufs = (
                 [
@@ -17477,8 +17528,38 @@ class MegaGemmLlama(nn.Module):
                     None,
                     self._gemma4_flat_ple_gate_bufs[layer_idx],
                 )
-                ple = torch.nn.functional.gelu(ple, approximate='tanh')
-                ple.mul_(per_layer_inputs[:, 0, layer_idx, :])
+                ple_condition = per_layer_inputs[:, 0, layer_idx, :]
+                use_conditioned_gelu = bool(
+                    getattr(
+                        self,
+                        "_gemma4_flat_ple_conditioned_gelu_enabled",
+                        False,
+                    )
+                    and not getattr(
+                        self,
+                        "_gemma4_flat_ple_conditioned_gelu_runtime_disabled",
+                        False,
+                    )
+                )
+                if use_conditioned_gelu:
+                    try:
+                        ple = conditioned_gelu_tanh_forward(
+                            ple,
+                            ple_condition,
+                            out=ple,
+                        )
+                    except Exception as exc:
+                        self._gemma4_flat_ple_conditioned_gelu_runtime_disabled = True
+                        if not self._gemma4_flat_ple_conditioned_gelu_first_failure:
+                            self._gemma4_flat_ple_conditioned_gelu_first_failure = (
+                                f"{type(exc).__name__}: {exc}"
+                            )
+                        use_conditioned_gelu = False
+                    else:
+                        self._gemma4_flat_ple_conditioned_gelu_hits += 1
+                if not use_conditioned_gelu:
+                    ple = torch.nn.functional.gelu(ple, approximate='tanh')
+                    ple.mul_(ple_condition)
                 ple_proj = self._flat_fp_linear(
                     ple,
                     lw.ple_proj_wt,

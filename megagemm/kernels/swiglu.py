@@ -77,6 +77,53 @@ def _mg_gated_activation_fwd_kernel(
 
 
 @triton.jit
+def _mg_conditioned_gelu_tanh_fwd_kernel(
+    gate_ptr,
+    condition_ptr,
+    output_ptr,
+    ELEMENTS: tl.constexpr,
+    WIDTH: tl.constexpr,
+    GATE_STRIDE_ROW: tl.constexpr,
+    GATE_STRIDE_COL: tl.constexpr,
+    CONDITION_STRIDE_ROW: tl.constexpr,
+    CONDITION_STRIDE_COL: tl.constexpr,
+    OUTPUT_STRIDE_ROW: tl.constexpr,
+    OUTPUT_STRIDE_COL: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Fuse the Gemma 4 PLE GELU-tanh and per-layer conditioning multiply.
+
+    The BF16 cast between GELU and multiply is intentional.  PyTorch's current
+    path materializes the GELU result into a BF16 tensor before ``mul_``; doing
+    the same cast in-register preserves that operation boundary without the
+    extra global-memory round trip or kernel launch.
+    """
+    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < ELEMENTS
+    rows = offsets // WIDTH
+    cols = offsets - rows * WIDTH
+    gate = tl.load(
+        gate_ptr + rows * GATE_STRIDE_ROW + cols * GATE_STRIDE_COL,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    condition = tl.load(
+        condition_ptr
+        + rows * CONDITION_STRIDE_ROW
+        + cols * CONDITION_STRIDE_COL,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    inner = 0.7978845608028654 * (gate + 0.044715 * gate * gate * gate)
+    activated_bf16 = (gate * tl.sigmoid(2.0 * inner)).to(tl.bfloat16)
+    tl.store(
+        output_ptr + rows * OUTPUT_STRIDE_ROW + cols * OUTPUT_STRIDE_COL,
+        activated_bf16.to(tl.float32) * condition,
+        mask=mask,
+    )
+
+
+@triton.jit
 def _mg_swiglu_bwd_kernel(
     grad_out_ptr,    # [M, H]
     input_ptr,       # [M, 2H]
@@ -262,6 +309,75 @@ def gated_activation_forward(
     if out is not None:
         return out
     return flat_output.view(expected_shape)
+
+
+def conditioned_gelu_tanh_forward(
+    gate: torch.Tensor,
+    condition: torch.Tensor,
+    *,
+    out: torch.Tensor = None,
+    block_size: int = 256,
+) -> torch.Tensor:
+    """Fuse ``GELU-tanh(gate) * condition`` for the Gemma 4 BF16 PLE tail.
+
+    ``condition`` may be a strided ``[batch, width]`` view into Gemma 4's
+    ``[batch, 1, layers, width]`` per-layer input tensor.  Supporting its row
+    stride directly is what keeps this path copy-free.
+    """
+    if gate.ndim != 2 or condition.ndim != 2:
+        raise ValueError("gate and condition must both be rank-2 tensors")
+    if tuple(gate.shape) != tuple(condition.shape):
+        raise ValueError(
+            "gate and condition shape mismatch: "
+            f"got {tuple(gate.shape)} and {tuple(condition.shape)}"
+        )
+    if not gate.is_cuda or not condition.is_cuda:
+        raise ValueError("conditioned_gelu_tanh_forward requires CUDA tensors")
+    if gate.device != condition.device:
+        raise ValueError("gate and condition must be on the same device")
+    if gate.dtype != torch.bfloat16 or condition.dtype != torch.bfloat16:
+        raise ValueError("conditioned_gelu_tanh_forward requires BF16 tensors")
+    if gate.stride(1) != 1 or condition.stride(1) != 1:
+        raise ValueError("gate and condition must have a contiguous last dimension")
+    if block_size not in (128, 256, 512, 1024):
+        raise ValueError("block_size must be one of 128, 256, 512, 1024")
+
+    if out is None:
+        output = torch.empty_like(gate, memory_format=torch.contiguous_format)
+    else:
+        if tuple(out.shape) != tuple(gate.shape):
+            raise ValueError(
+                f"out shape mismatch: got {tuple(out.shape)} expected {tuple(gate.shape)}"
+            )
+        if out.device != gate.device or out.dtype != gate.dtype:
+            raise ValueError("out must match gate device and dtype")
+        if out.ndim != 2 or out.stride(1) != 1:
+            raise ValueError("out must be rank-2 with a contiguous last dimension")
+        output = out
+
+    rows, width = map(int, gate.shape)
+    elements = rows * width
+    if elements == 0:
+        return output
+    _mg_conditioned_gelu_tanh_fwd_kernel[
+        (triton.cdiv(elements, block_size),)
+    ](
+        gate,
+        condition,
+        output,
+        ELEMENTS=elements,
+        WIDTH=width,
+        GATE_STRIDE_ROW=int(gate.stride(0)),
+        GATE_STRIDE_COL=int(gate.stride(1)),
+        CONDITION_STRIDE_ROW=int(condition.stride(0)),
+        CONDITION_STRIDE_COL=int(condition.stride(1)),
+        OUTPUT_STRIDE_ROW=int(output.stride(0)),
+        OUTPUT_STRIDE_COL=int(output.stride(1)),
+        BLOCK_SIZE=int(block_size),
+        num_warps=4 if block_size >= 256 else 2,
+        num_stages=1,
+    )
+    return output
 
 
 # =============================================================================

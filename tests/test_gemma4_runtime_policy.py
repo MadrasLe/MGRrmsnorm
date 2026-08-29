@@ -28,6 +28,7 @@ def test_e2b_l4_policy_preserves_measured_multi_step_triton_path():
     assert policy.paged_decode_gqa2_direct is True
     assert policy.paged_decode_warps_h256 == 2
     assert policy.gemma4_dense_post_norm_chain is True
+    assert policy.gemma4_ple_conditioned_gelu_decode is False
     assert policy.gemma4_e2b_l4_sliding_prefill is True
     assert policy.gemma4_bf16_fused_gateup_rows == ()
     assert policy.gemma4_bf16_deepfusion_rows == ()
@@ -46,6 +47,7 @@ def test_e4b_l4_policy_preserves_measured_step_and_reuse_path():
     assert policy.paged_decode_gqa2_direct is False
     assert policy.paged_decode_warps_h256 == 0
     assert policy.gemma4_dense_post_norm_chain is False
+    assert policy.gemma4_ple_conditioned_gelu_decode is False
     assert policy.gemma4_e2b_l4_sliding_prefill is False
     assert policy.gemma4_bf16_fused_gateup_rows == ()
     assert policy.gemma4_bf16_deepfusion_rows == ()
@@ -63,6 +65,7 @@ def test_gemma4_policy_is_not_promoted_to_unmeasured_hardware():
     assert policy.paged_decode_gqa2_direct is False
     assert policy.paged_decode_warps_h256 == 0
     assert policy.gemma4_dense_post_norm_chain is False
+    assert policy.gemma4_ple_conditioned_gelu_decode is False
     assert policy.gemma4_e2b_l4_sliding_prefill is False
     assert policy.gemma4_bf16_fused_gateup_rows == ()
     assert policy.gemma4_bf16_deepfusion_rows == ()
