@@ -5261,6 +5261,11 @@ class LlamaAttention(nn.Module):
             and hidden_states.is_cuda
             and _prefill_timing_enabled()
         )
+        prefill_timing_suffix = None
+        if do_prefill_stage_timing:
+            prefill_timing_suffix = (
+                "sliding" if self.sliding_window > 0 else "full"
+            )
 
         use_shared_prefill_kv = self.is_kv_shared and is_prefill and shared_prefill_kv is not None
         if self.is_kv_shared and is_prefill and shared_prefill_kv is None:
@@ -5305,6 +5310,10 @@ class LlamaAttention(nn.Module):
                         prefill_attr="_prefill_v_out",
                     )
         _timing_record_end(timing_events, "qkv", qkv_start_end)
+        if prefill_timing_suffix is not None:
+            timing_events.setdefault(f"qkv_{prefill_timing_suffix}", []).append(
+                qkv_start_end
+            )
         if finite_trace is not None:
             _record_gemma4_prefill_finite_trace(
                 finite_trace, self.layer_idx, "attention.q_raw", q_raw
@@ -5457,6 +5466,10 @@ class LlamaAttention(nn.Module):
                     v_cache.copy_(v.transpose(1, 2))
 
         _timing_record_end(timing_events, "attn_prepare", attn_prepare_start_end)
+        if prefill_timing_suffix is not None:
+            timing_events.setdefault(
+                f"attn_prepare_{prefill_timing_suffix}", []
+            ).append(attn_prepare_start_end)
         if finite_trace is not None:
             _record_gemma4_prefill_finite_trace(
                 finite_trace, self.layer_idx, "attention.q_prepared", q
@@ -5508,6 +5521,10 @@ class LlamaAttention(nn.Module):
                 sliding_window=self.sliding_window if self.sliding_window > 0 else None,
             ).unsqueeze(2)
         _timing_record_end(timing_events, "attn_core", attn_core_start_end)
+        if prefill_timing_suffix is not None:
+            timing_events.setdefault(
+                f"attn_core_{prefill_timing_suffix}", []
+            ).append(attn_core_start_end)
         if finite_trace is not None:
             _record_gemma4_prefill_finite_trace(
                 finite_trace, self.layer_idx, "attention.core_out", attn_out
@@ -5523,6 +5540,10 @@ class LlamaAttention(nn.Module):
             prefill_attr="_prefill_o_out",
         )
         _timing_record_end(timing_events, "o_proj", o_proj_start_end)
+        if prefill_timing_suffix is not None:
+            timing_events.setdefault(f"o_proj_{prefill_timing_suffix}", []).append(
+                o_proj_start_end
+            )
         if finite_trace is not None:
             _record_gemma4_prefill_finite_trace(
                 finite_trace, self.layer_idx, "attention.o_proj", output
@@ -10117,9 +10138,13 @@ class LlamaDecoderLayer(nn.Module):
                         finite_trace, self.layer_idx, "moe.combined_out", mlp_out
                     )
             else:
+                norm_start_end = _timing_record_start(do_leaf_timing)
                 mlp_in = self.pre_feedforward_layernorm(hidden_states)
+                _timing_record_end(timing_events, "gemma4_norms", norm_start_end)
                 mlp_out = self.mlp(mlp_in, timing_events=timing_events, is_prefill=is_prefill)
+                norm_start_end = _timing_record_start(do_leaf_timing)
                 mlp_out = self.post_feedforward_layernorm(mlp_out)
+                _timing_record_end(timing_events, "gemma4_norms", norm_start_end)
             _timing_record_end(timing_events, "mlp", mlp_start_end)
             residual_start_end = _timing_record_start(do_leaf_timing)
             if not mlp_residual_fused:
@@ -10139,6 +10164,7 @@ class LlamaDecoderLayer(nn.Module):
                 )
 
             if per_layer_input is not None and self.per_layer_input_gate is not None:
+                ple_start_end = _timing_record_start(do_leaf_timing)
                 residual = hidden_states
                 ple = self._gemma4_ple_linear(
                     self.per_layer_input_gate,
@@ -10164,6 +10190,7 @@ class LlamaDecoderLayer(nn.Module):
                     hidden_states = residual + ple
                 else:
                     hidden_states = residual.add_(ple)
+                _timing_record_end(timing_events, "ple", ple_start_end)
 
             layer_scale = self.layer_scalar.to(dtype=hidden_states.dtype)
             residual_start_end = _timing_record_start(do_leaf_timing)
@@ -14315,27 +14342,47 @@ class MegaGemmLlama(nn.Module):
         torch.cuda.synchronize()
         summary = {k: v for k, v in meta.items()}
         total_ms = 0.0
+        detail_only = {
+            f"{aggregate}_{topology}"
+            for aggregate in ("qkv", "attn_prepare", "attn_core", "o_proj")
+            for topology in ("sliding", "full")
+        }
         for name, pairs in timing_events.items():
             ms = sum(start.elapsed_time(end) for start, end in pairs)
             summary[f"{name}_ms"] = ms
-            total_ms += ms
+            if name not in detail_only:
+                total_ms += ms
         summary["total_ms"] = total_ms
         self._last_prefill_timing = summary
         if _PREFILL_TIMING_PRINT:
             ordered = [
                 ("mlp_native_ms", "mlp_native"),
                 ("qkv_ms", "qkv"),
+                ("qkv_sliding_ms", "qkv_sliding"),
+                ("qkv_full_ms", "qkv_full"),
                 ("attn_prepare_ms", "attn_prepare"),
+                ("attn_prepare_sliding_ms", "prepare_sliding"),
+                ("attn_prepare_full_ms", "prepare_full"),
                 ("attn_core_ms", "attn"),
+                ("attn_core_sliding_ms", "attn_sliding"),
+                ("attn_core_full_ms", "attn_full"),
                 ("o_proj_ms", "o"),
+                ("o_proj_sliding_ms", "o_sliding"),
+                ("o_proj_full_ms", "o_full"),
                 ("gate_up_ms", "gate_up"),
                 ("down_proj_ms", "down"),
                 ("moe_router_ms", "moe_router"),
                 ("moe_experts_ms", "moe_experts"),
                 ("gemma4_norms_ms", "gemma4_norms"),
                 ("gemma4_residual_scale_ms", "gemma4_residual"),
+                ("ple_ms", "ple"),
+                ("prefill_setup_ms", "setup"),
+                ("embedding_ms", "embedding"),
+                ("per_layer_input_ms", "per_layer_input"),
                 ("kv_write_ms", "kv"),
+                ("final_norm_ms", "final_norm"),
                 ("lm_head_ms", "lm_head"),
+                ("logit_cap_ms", "logit_cap"),
             ]
             parts = []
             for key, label in ordered:
@@ -14615,6 +14662,7 @@ class MegaGemmLlama(nn.Module):
         uniform_full_length = all(length == max_len for length in lengths_cpu)
 
         # --- Build attention mask: causal + padding ---
+        setup_start_end = _timing_record_start(timing_events is not None)
         # pad_mask[i, j] = True if position j is a real token for sequence i
         offsets = max_len - lengths  # [N] — how many pad tokens per seq
         pos_range = self._get_prefill_arange(max_len, device)  # [max_len]
@@ -14656,15 +14704,24 @@ class MegaGemmLlama(nn.Module):
         # --- Build position IDs (adjusted for left-padding) ---
         # For left-padded seq: positions should be [0,0,...,0,1,2,...,len-1]
         positions = (pos_range.unsqueeze(0) - offsets.unsqueeze(1)).clamp(min=0)  # [N, max_len]
+        _timing_record_end(timing_events, "prefill_setup", setup_start_end)
 
         # --- Forward pass through all layers ---
+        embedding_start_end = _timing_record_start(timing_events is not None)
         hidden = self.embed_tokens(input_ids)
         hidden = self._scale_token_embeddings(hidden)
+        _timing_record_end(timing_events, "embedding", embedding_start_end)
         if finite_trace is not None:
             _record_gemma4_prefill_finite_trace(
                 finite_trace, -1, "model.embedding", hidden
             )
+        per_layer_input_start_end = _timing_record_start(timing_events is not None)
         per_layer_inputs = self._compute_per_layer_inputs(input_ids, hidden)
+        _timing_record_end(
+            timing_events,
+            "per_layer_input",
+            per_layer_input_start_end,
+        )
         shared_prefill_kv: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
         (
             parallel_moe_stream,
@@ -14832,17 +14889,23 @@ class MegaGemmLlama(nn.Module):
         # Left-padding aligns every final real token at -1. Project only those
         # N rows through Gemma's 262k-vocabulary head, never N * max_len rows.
         self._prefill_last_token_only_hits += 1
+        final_norm_start_end = _timing_record_start(timing_events is not None)
         last_hidden = self.norm(hidden[:, -1:, :])
+        _timing_record_end(timing_events, "final_norm", final_norm_start_end)
         if finite_trace is not None:
             _record_gemma4_prefill_finite_trace(
                 finite_trace, -1, "model.final_norm", last_hidden
             )
+        lm_head_start_end = _timing_record_start(timing_events is not None)
         last_logits = self.lm_head(last_hidden)
+        _timing_record_end(timing_events, "lm_head", lm_head_start_end)
         if finite_trace is not None:
             _record_gemma4_prefill_finite_trace(
                 finite_trace, -1, "model.raw_logits", last_logits
             )
+        logit_cap_start_end = _timing_record_start(timing_events is not None)
         last_logits = self._apply_final_logit_capping(last_logits)
+        _timing_record_end(timing_events, "logit_cap", logit_cap_start_end)
         if finite_trace is not None:
             _record_gemma4_prefill_finite_trace(
                 finite_trace, -1, "model.capped_logits", last_logits
