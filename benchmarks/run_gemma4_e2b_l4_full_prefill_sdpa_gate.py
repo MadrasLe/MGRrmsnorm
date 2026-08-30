@@ -91,12 +91,16 @@ def decide(
         and speedup >= minimum_speedup
         and stable
     )
+    if apply_change and winner is not None:
+        decision = (
+            "PROMOTE_IMPLICIT_CAUSAL_EXPANDED_SDPA"
+            if winner["case"] == "implicit_expanded"
+            else "PROMOTE_IMPLICIT_CAUSAL_NATIVE_SDPA"
+        )
+    else:
+        decision = "KEEP_EXPLICIT_AND_BUILD_TRITON_FULL_H512"
     return {
-        "decision": (
-            "PROMOTE_IMPLICIT_CAUSAL_SDPA"
-            if apply_change
-            else "KEEP_EXPLICIT_AND_BUILD_TRITON_FULL_H512"
-        ),
+        "decision": decision,
         "apply_change": apply_change,
         "baseline": "explicit_native_recheck",
         "baseline_us": baseline_us,

@@ -40,9 +40,24 @@ def test_decision_promotes_fast_stable_implicit_candidate():
         minimum_speedup=1.03,
         maximum_spread=1.05,
     )
-    assert result["decision"] == "PROMOTE_IMPLICIT_CAUSAL_SDPA"
+    assert result["decision"] == "PROMOTE_IMPLICIT_CAUSAL_NATIVE_SDPA"
     assert result["winner"] == "implicit_native"
     assert result["speedup"] == pytest.approx(5.05)
+
+
+def test_decision_names_expanded_winner_explicitly():
+    module = _load_module()
+    result = module.decide(
+        [
+            _row("implicit_native", 105_000.0),
+            _row("implicit_expanded", 13_400.0),
+            _row("explicit_native_recheck", 104_000.0),
+        ],
+        minimum_speedup=1.03,
+        maximum_spread=1.05,
+    )
+    assert result["decision"] == "PROMOTE_IMPLICIT_CAUSAL_EXPANDED_SDPA"
+    assert result["winner"] == "implicit_expanded"
 
 
 def test_decision_rejects_unstable_candidate():

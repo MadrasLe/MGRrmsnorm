@@ -29,6 +29,7 @@ class RuntimePolicy:
     gemma4_e2b_h512_dense_bridge_pair: bool = False
     gemma4_ple_conditioned_gelu_decode: bool = False
     gemma4_e2b_l4_sliding_prefill: bool = False
+    gemma4_e2b_l4_full_prefill_expand: bool = False
     gemma4_bf16_fused_gateup_rows: tuple[int, ...] = ()
     gemma4_bf16_deepfusion_rows: tuple[int, ...] = ()
     gemma4_bf16_cublas_gateup_rows: tuple[int, ...] = ()

@@ -4751,6 +4751,9 @@ class LlamaAttention(nn.Module):
         self._gemma4_implicit_causal_prefill_hits = 0
         self._gemma4_e2b_l4_sliding_prefill_enabled = False
         self._gemma4_e2b_l4_sliding_prefill_hits = 0
+        self._gemma4_e2b_l4_full_prefill_expand_enabled = False
+        self._gemma4_e2b_l4_full_prefill_expand_hits = 0
+        self._gemma4_e2b_l4_full_prefill_expand_error = ""
         self._gemma4_long_sliding_prefill_hits = 0
         self._gemma4_long_full_prefill_hits = 0
         self._prefill_prepared_q = None
@@ -4878,6 +4881,43 @@ class LlamaAttention(nn.Module):
             and k_len <= int(self.sliding_window)
         )
         if self.sliding_window <= 0:
+            use_e2b_l4_expanded_full = bool(
+                implicit_causal
+                and self._gemma4_e2b_l4_full_prefill_expand_enabled
+                and q.ndim == 4
+                and k.ndim == 4
+                and v.ndim == 4
+                and int(q.shape[0]) == 8
+                and int(q.shape[1]) == 8
+                and 2048 <= q_len <= 2304
+                and q_len == k_len
+                and int(q.shape[3]) == 512
+                and tuple(k.shape) == (8, 1, q_len, 512)
+                and tuple(v.shape) == tuple(k.shape)
+                and q.dtype == torch.bfloat16
+                and k.dtype == q.dtype
+                and v.dtype == q.dtype
+            )
+            if use_e2b_l4_expanded_full:
+                try:
+                    expanded_k = k.repeat_interleave(8, dim=1)
+                    expanded_v = v.repeat_interleave(8, dim=1)
+                    expanded_out = prefill_attention(
+                        q,
+                        expanded_k,
+                        expanded_v,
+                        is_causal=True,
+                        attn_mask=None,
+                        scale=self.scale,
+                    )
+                    self._gemma4_e2b_l4_full_prefill_expand_hits += 1
+                    self._gemma4_implicit_causal_prefill_hits += 1
+                    return expanded_out
+                except Exception as exc:
+                    self._gemma4_e2b_l4_full_prefill_expand_enabled = False
+                    self._gemma4_e2b_l4_full_prefill_expand_error = (
+                        f"{type(exc).__name__}: {exc}"
+                    )
             if implicit_causal and _GEMMA4_LONG_FULL_PREFILL:
                 long_full_out = gemma4_long_full_prefill_attention(
                     q,
@@ -11075,11 +11115,19 @@ class MegaGemmLlama(nn.Module):
             "MEGAGEMM_GEMMA4_E2B_L4_SLIDING_PREFILL",
             "gemma4_e2b_l4_sliding_prefill",
         )
+        e2b_l4_full_prefill_expand = policy_bool(
+            self,
+            "MEGAGEMM_GEMMA4_E2B_L4_FULL_PREFILL_EXPAND",
+            "gemma4_e2b_l4_full_prefill_expand",
+        )
         for layer in self.layers:
             attention = getattr(layer, "self_attn", None)
             if attention is not None:
                 attention._gemma4_e2b_l4_sliding_prefill_enabled = bool(
                     e2b_l4_sliding_prefill
+                )
+                attention._gemma4_e2b_l4_full_prefill_expand_enabled = bool(
+                    e2b_l4_full_prefill_expand
                 )
         explicit_rmsnorm = os.environ.get(
             "MEGAGEMM_DISABLE_CUDA_RMSNORM", ""
@@ -12891,6 +12939,46 @@ class MegaGemmLlama(nn.Module):
             )
             for attn in full_attn_layers
         )
+        gemma4_e2b_l4_full_prefill_expand_hits = sum(
+            int(
+                getattr(
+                    attn,
+                    "_gemma4_e2b_l4_full_prefill_expand_hits",
+                    0,
+                )
+            )
+            for attn in full_attn_layers
+        )
+        gemma4_e2b_l4_full_prefill_expand_enabled_layers = sum(
+            int(
+                bool(
+                    getattr(
+                        attn,
+                        "_gemma4_e2b_l4_full_prefill_expand_enabled",
+                        False,
+                    )
+                )
+            )
+            for attn in full_attn_layers
+        )
+        gemma4_e2b_l4_full_prefill_expand_error = next(
+            (
+                str(
+                    getattr(
+                        attn,
+                        "_gemma4_e2b_l4_full_prefill_expand_error",
+                        "",
+                    )
+                )
+                for attn in full_attn_layers
+                if getattr(
+                    attn,
+                    "_gemma4_e2b_l4_full_prefill_expand_error",
+                    "",
+                )
+            ),
+            "",
+        )
         gemma4_long_sliding_prefill_hits = sum(
             int(getattr(attn, "_gemma4_long_sliding_prefill_hits", 0))
             for attn in full_attn_layers
@@ -13217,6 +13305,18 @@ class MegaGemmLlama(nn.Module):
             ),
             "gemma4_e2b_l4_sliding_prefill_hits": int(
                 gemma4_e2b_l4_sliding_prefill_hits
+            ),
+            "gemma4_e2b_l4_full_prefill_expand_enabled": bool(
+                gemma4_e2b_l4_full_prefill_expand_enabled_layers > 0
+            ),
+            "gemma4_e2b_l4_full_prefill_expand_enabled_layers": int(
+                gemma4_e2b_l4_full_prefill_expand_enabled_layers
+            ),
+            "gemma4_e2b_l4_full_prefill_expand_hits": int(
+                gemma4_e2b_l4_full_prefill_expand_hits
+            ),
+            "gemma4_e2b_l4_full_prefill_expand_error": (
+                gemma4_e2b_l4_full_prefill_expand_error
             ),
             "gemma4_long_sliding_prefill_enabled": bool(
                 _GEMMA4_LONG_SLIDING_PREFILL
