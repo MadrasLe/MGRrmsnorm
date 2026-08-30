@@ -25,6 +25,7 @@ def _sample(repeat: int, offset: float = 0.0):
         "wall_ms": 2800.0 + offset,
         "internal_prefill_ms": 2700.0 + offset,
         "internal_decode_ms": 20.0,
+        "prefill_stage_total_tokens": 16456,
         "prefill_stage_timing": {
             "qkv_ms": 300.0 + offset,
             "qkv_sliding_ms": 200.0 + offset,

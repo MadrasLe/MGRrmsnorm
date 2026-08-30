@@ -16,7 +16,7 @@ echo "GPU: $GPU_NAME"
   exit 2
 }
 
-if ! python - <<'PY'
+if ! python - <<'PY' >/dev/null 2>&1
 import huggingface_hub
 import psutil
 import safetensors

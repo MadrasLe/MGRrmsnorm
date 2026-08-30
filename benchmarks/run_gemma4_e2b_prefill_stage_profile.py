@@ -160,6 +160,11 @@ def summarize_samples(samples: list[dict[str, Any]]) -> dict[str, Any]:
     top = ranking[0] if ranking else None
     return {
         "samples": len(samples),
+        "engine_prefill_tokens_median": int(
+            _median(
+                [float(sample["prefill_stage_total_tokens"]) for sample in samples]
+            )
+        ),
         "internal_prefill_ms_median": internal_prefill_ms,
         "first_token_wall_ms_median": _median(
             [float(sample["wall_ms"]) for sample in samples]
@@ -336,6 +341,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         f"tracked={summary['tracked_cuda_ms_median']:.2f}ms "
         f"unattributed={summary['unattributed_internal_prefill_ms']:.2f}ms"
     )
+    print(f"ENGINE_PREFILL_TOKENS {summary['engine_prefill_tokens_median']}")
     print(f"NEXT_TARGET {summary['next_target']}")
     print("PREFILL_PROFILE " + json.dumps(summary, ensure_ascii=False))
     print(f"Wrote: {args.output}")
