@@ -117,6 +117,29 @@ def _sample(
             value = scheduler.get(source)
             if value is not None:
                 internal[target] = float(value)
+    decode_runtime = extra.get("decode_runtime_stats")
+    full_prefill_path: dict[str, Any] = {}
+    if isinstance(decode_runtime, dict):
+        full_prefill_path = {
+            "enabled": bool(
+                decode_runtime.get("gemma4_e2b_l4_full_prefill_expand_enabled")
+            ),
+            "enabled_layers": int(
+                decode_runtime.get(
+                    "gemma4_e2b_l4_full_prefill_expand_enabled_layers",
+                    0,
+                )
+                or 0
+            ),
+            "hits": int(
+                decode_runtime.get("gemma4_e2b_l4_full_prefill_expand_hits", 0)
+                or 0
+            ),
+            "error": str(
+                decode_runtime.get("gemma4_e2b_l4_full_prefill_expand_error")
+                or ""
+            ),
+        }
     return {
         "pair_index": pair_index,
         "order_position": order_position,
@@ -125,6 +148,7 @@ def _sample(
         "elapsed_s": elapsed_s,
         "output_tps": generated_tokens / elapsed_s,
         "internal": internal,
+        "full_prefill_path": full_prefill_path,
     }
 
 
@@ -190,6 +214,19 @@ def summarize_samples(
     median_short = _median(short_elapsed)
     median_long = _median(long_elapsed)
     median_decode = _median(decode_elapsed)
+    full_prefill_samples = [
+        sample["full_prefill_path"]
+        for sample in samples
+        if isinstance(sample.get("full_prefill_path"), dict)
+        and sample["full_prefill_path"]
+    ]
+    full_prefill_errors = sorted(
+        {
+            str(item.get("error") or "")
+            for item in full_prefill_samples
+            if item.get("error")
+        }
+    )
     return {
         "complete_pairs": len(pairs),
         "pairs": pairs,
@@ -207,6 +244,22 @@ def summarize_samples(
         ),
         "internal_long_prefill_ms": _median(long_internal_prefill),
         "internal_long_decode_ms": _median(long_internal_decode),
+        "e2b_l4_full_prefill_expand": {
+            "observed": bool(full_prefill_samples),
+            "enabled_all_samples": bool(
+                full_prefill_samples
+                and all(item.get("enabled") for item in full_prefill_samples)
+            ),
+            "enabled_layers_max": max(
+                (int(item.get("enabled_layers", 0)) for item in full_prefill_samples),
+                default=0,
+            ),
+            "hits_max": max(
+                (int(item.get("hits", 0)) for item in full_prefill_samples),
+                default=0,
+            ),
+            "errors": full_prefill_errors,
+        },
         "method": {
             "first_token_phase": (
                 f"wall time for {short_tokens} generated token per request; "
@@ -300,6 +353,28 @@ def measure(args: argparse.Namespace) -> dict[str, Any]:
         short_tokens=args.short_tokens,
         long_tokens=args.long_tokens,
     )
+    if (
+        args.backend == "megagemm"
+        and args.batch_size == 8
+        and args.prompt_tokens >= 2048
+    ):
+        full_prefill_audit = summary["e2b_l4_full_prefill_expand"]
+        if not full_prefill_audit["enabled_all_samples"]:
+            raise RuntimeError(
+                "promoted E2B/L4 full-H512 expanded implicit-causal prefill "
+                "path was not enabled for every measured sample"
+            )
+        if int(full_prefill_audit["hits_max"]) <= 0:
+            raise RuntimeError(
+                "promoted E2B/L4 full-H512 expanded implicit-causal prefill "
+                "path recorded zero hits"
+            )
+        if full_prefill_audit["errors"]:
+            raise RuntimeError(
+                "promoted E2B/L4 full-H512 expanded implicit-causal prefill "
+                "path reported runtime errors: "
+                + "; ".join(full_prefill_audit["errors"])
+            )
     payload = {
         "benchmark": "gemma4_e2b_paired_phase_split",
         "backend": args.backend,

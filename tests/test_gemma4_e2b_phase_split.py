@@ -26,24 +26,48 @@ def _samples():
             "max_new_tokens_per_request": 1,
             "elapsed_s": 2.0,
             "internal": {"prefill_ms": 1900.0},
+            "full_prefill_path": {
+                "enabled": True,
+                "enabled_layers": 7,
+                "hits": 7,
+                "error": "",
+            },
         },
         {
             "pair_index": 1,
             "max_new_tokens_per_request": 128,
             "elapsed_s": 5.0,
             "internal": {"prefill_ms": 1910.0, "decode_ms": 3050.0},
+            "full_prefill_path": {
+                "enabled": True,
+                "enabled_layers": 7,
+                "hits": 14,
+                "error": "",
+            },
         },
         {
             "pair_index": 2,
             "max_new_tokens_per_request": 128,
             "elapsed_s": 5.3,
             "internal": {"prefill_ms": 1930.0, "decode_ms": 3100.0},
+            "full_prefill_path": {
+                "enabled": True,
+                "enabled_layers": 7,
+                "hits": 21,
+                "error": "",
+            },
         },
         {
             "pair_index": 2,
             "max_new_tokens_per_request": 1,
             "elapsed_s": 2.2,
             "internal": {"prefill_ms": 1920.0},
+            "full_prefill_path": {
+                "enabled": True,
+                "enabled_layers": 7,
+                "hits": 28,
+                "error": "",
+            },
         },
     ]
 
@@ -64,6 +88,13 @@ def test_paired_phase_summary_uses_delta_for_127_tokens_per_request():
     assert result["long_total_ms"] == pytest.approx(5150.0)
     assert result["internal_long_prefill_ms"] == pytest.approx(1920.0)
     assert result["internal_long_decode_ms"] == pytest.approx(3075.0)
+    assert result["e2b_l4_full_prefill_expand"] == {
+        "observed": True,
+        "enabled_all_samples": True,
+        "enabled_layers_max": 7,
+        "hits_max": 28,
+        "errors": [],
+    }
 
 
 def test_measurement_arguments_are_json_serializable_paths():

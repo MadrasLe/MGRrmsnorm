@@ -84,6 +84,7 @@ def resolve_runtime_policy(config: Any, device_name: str = "") -> RuntimePolicy:
             gemma4_dense_post_norm_chain=True,
             gemma4_e2b_h512_dense_bridge_pair=True,
             gemma4_e2b_l4_sliding_prefill=True,
+            gemma4_e2b_l4_full_prefill_expand=True,
             gemma4_bf16_cublas_gateup_rows=(8,),
             gemma4_bf16_cublas_down_rows=(8,),
             reason=(
@@ -97,7 +98,10 @@ def resolve_runtime_policy(config: Any, device_name: str = "") -> RuntimePolicy:
                 "retains cuBLAS for gate-up and down instead of the slower "
                 "fused gate-up and deepfusion MLP kernels, while "
                 "long sliding prefill uses the dedicated B8/Q8/KV1/H256/W512 "
-                "Triton kernel"
+                "Triton kernel; long full-H512 prefill expands the single KV "
+                "head once per layer and uses implicit-causal SDPA, promoted "
+                "after an exact-output loaded-model A/B measured a 24.84% "
+                "prefill-time reduction"
             ),
         )
     if topology == (42, 2560, 8, 2):

@@ -107,6 +107,7 @@ GEMMA4_PROFILE_REQUIREMENTS = {
         "require_e2b_h512_dense_bridge_pair": True,
         "require_bf16_batch8_cublas_mlp": True,
         "require_e2b_l4_sliding_prefill": True,
+        "require_e2b_l4_full_prefill_expand": True,
         "topology": {
             "num_hidden_layers": 35,
             "hidden_size": 1536,
@@ -134,6 +135,7 @@ GEMMA4_PROFILE_REQUIREMENTS = {
         "require_dense_post_norm_chain": False,
         "require_bf16_batch8_cublas_mlp": False,
         "require_e2b_l4_sliding_prefill": False,
+        "require_e2b_l4_full_prefill_expand": False,
         "topology": {
             "num_hidden_layers": 42,
             "hidden_size": 2560,
@@ -804,6 +806,48 @@ def audit_gemma4_dense_fast_path(path: Path, profile: str) -> dict:
                 "E2B L4 BF16 long sliding-prefill Triton kernel was never exercised"
             )
 
+    require_e2b_l4_full_prefill_expand = bool(
+        requirement.get("require_e2b_l4_full_prefill_expand", False)
+    )
+    e2b_l4_full_prefill_expand_applicable = bool(
+        require_e2b_l4_full_prefill_expand and e2b_l4_long_rows
+    )
+    e2b_l4_full_prefill_expand_enabled = bool(
+        e2b_l4_long_stats
+        and all(
+            stats.get("gemma4_e2b_l4_full_prefill_expand_enabled")
+            for stats in e2b_l4_long_stats
+        )
+    )
+    e2b_l4_full_prefill_expand_hits = _max_counter(
+        e2b_l4_long_stats,
+        "gemma4_e2b_l4_full_prefill_expand_hits",
+    )
+    e2b_l4_full_prefill_expand_errors = sorted(
+        {
+            str(stats.get("gemma4_e2b_l4_full_prefill_expand_error") or "")
+            for stats in e2b_l4_long_stats
+            if stats.get("gemma4_e2b_l4_full_prefill_expand_error")
+        }
+    )
+    if e2b_l4_full_prefill_expand_applicable:
+        if not e2b_l4_full_prefill_expand_enabled:
+            errors.append(
+                "E2B L4 BF16 long full-H512 expanded implicit-causal prefill "
+                "policy was not enabled"
+            )
+        if e2b_l4_full_prefill_expand_hits <= 0:
+            errors.append(
+                "E2B L4 BF16 long full-H512 expanded implicit-causal prefill "
+                "path was never exercised"
+            )
+        if e2b_l4_full_prefill_expand_errors:
+            errors.append(
+                "E2B L4 BF16 long full-H512 expanded implicit-causal prefill "
+                "reported runtime errors: "
+                + "; ".join(e2b_l4_full_prefill_expand_errors)
+            )
+
     performance_gate = {
         "applicable": False,
         "hardware": None,
@@ -908,6 +952,19 @@ def audit_gemma4_dense_fast_path(path: Path, profile: str) -> dict:
             ),
             "e2b_l4_sliding_prefill_enabled": e2b_l4_sliding_prefill_enabled,
             "e2b_l4_sliding_prefill_hits": e2b_l4_sliding_prefill_hits,
+            "e2b_l4_full_prefill_expand_required": (
+                require_e2b_l4_full_prefill_expand
+            ),
+            "e2b_l4_full_prefill_expand_applicable": (
+                e2b_l4_full_prefill_expand_applicable
+            ),
+            "e2b_l4_full_prefill_expand_enabled": (
+                e2b_l4_full_prefill_expand_enabled
+            ),
+            "e2b_l4_full_prefill_expand_hits": e2b_l4_full_prefill_expand_hits,
+            "e2b_l4_full_prefill_expand_errors": (
+                e2b_l4_full_prefill_expand_errors
+            ),
         },
         "expected_topology": expected_topology,
         "observed_topology": topology_stats[0] if topology_stats else None,
@@ -932,6 +989,9 @@ def audit_gemma4_dense_fast_path(path: Path, profile: str) -> dict:
             ),
             "gemma4_e2b_l4_sliding_prefill": _max_counter(
                 decode_stats, "gemma4_e2b_l4_sliding_prefill_hits"
+            ),
+            "gemma4_e2b_l4_full_prefill_expand": _max_counter(
+                decode_stats, "gemma4_e2b_l4_full_prefill_expand_hits"
             ),
             "gemma4_flat_fused_gateup": _max_counter(
                 decode_stats, "gemma4_flat_fused_gateup_hits"

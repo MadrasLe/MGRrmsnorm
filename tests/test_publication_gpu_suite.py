@@ -432,8 +432,12 @@ def test_e2b_audit_requires_promoted_l4_long_sliding_prefill_hits(tmp_path):
             "gemma4_flat_deepfusion_hits": 0,
             "gemma4_e2b_l4_sliding_prefill_enabled": True,
             "gemma4_e2b_l4_sliding_prefill_hits": 224,
+            "gemma4_e2b_l4_full_prefill_expand_enabled": True,
+            "gemma4_e2b_l4_full_prefill_expand_hits": 56,
+            "gemma4_e2b_l4_full_prefill_expand_error": "",
             "runtime_policy": {
                 "gemma4_e2b_h512_dense_bridge_pair": True,
+                "gemma4_e2b_l4_full_prefill_expand": True,
             },
             "gemma4_dense_attn_mlp_bridge_decode_enabled": True,
             "gemma4_dense_attn_mlp_bridge_decode_hits": 4445,
@@ -469,10 +473,27 @@ def test_e2b_audit_requires_promoted_l4_long_sliding_prefill_hits(tmp_path):
     assert report["required"]["e2b_l4_sliding_prefill_applicable"] is True
     assert report["required"]["e2b_l4_sliding_prefill_enabled"] is True
     assert report["required"]["e2b_l4_sliding_prefill_hits"] == 224
+    assert report["required"]["e2b_l4_full_prefill_expand_applicable"] is True
+    assert report["required"]["e2b_l4_full_prefill_expand_enabled"] is True
+    assert report["required"]["e2b_l4_full_prefill_expand_hits"] == 56
+    assert report["required"]["e2b_l4_full_prefill_expand_errors"] == []
     assert report["performance_gate"]["floors"][
         "long_context/b8/p2048"
     ] == 115.0
 
+    row["decode_runtime_stats"]["gemma4_e2b_l4_full_prefill_expand_hits"] = 0
+    raw_path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    rejected = runner.audit_gemma4_dense_fast_path(
+        raw_path, "gemma4-e2b-fast"
+    )
+    assert rejected["status"] == "failed"
+    assert any(
+        "full-H512 expanded implicit-causal prefill path was never exercised"
+        in error
+        for error in rejected["errors"]
+    )
+
+    row["decode_runtime_stats"]["gemma4_e2b_l4_full_prefill_expand_hits"] = 56
     row["decode_runtime_stats"]["gemma4_e2b_l4_sliding_prefill_hits"] = 0
     raw_path.write_text(json.dumps(row) + "\n", encoding="utf-8")
     rejected = runner.audit_gemma4_dense_fast_path(
