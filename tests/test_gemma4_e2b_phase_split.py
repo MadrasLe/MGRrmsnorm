@@ -92,6 +92,7 @@ def test_paired_phase_summary_uses_delta_for_127_tokens_per_request():
         "observed": True,
         "enabled_all_samples": True,
         "enabled_layers_max": 7,
+        "enabled_layers_values": [7],
         "hits_max": 28,
         "errors": [],
     }

@@ -114,11 +114,18 @@ def main() -> int:
     parser.add_argument("--out", default="gemma4_decode_profile.json")
     args = parser.parse_args()
 
-    # Must be set before importing megagemm.models.llama.
-    os.environ.setdefault("MEGAGEMM_DECODE_TIMING", "1")
-    os.environ.setdefault("MEGAGEMM_DECODE_TIMING_PRINT", "0")
-
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+    # Recreate the promoted E2B profile in every process instead of inheriting
+    # stale notebook flags.  Decode timing must then be enabled before llama.py
+    # is imported because its instrumentation flags are module-level.
+    from benchmarks.run_gemma4_e2b_phase_split import (
+        _configure_megagemm_profile,
+    )
+
+    profile_environment = _configure_megagemm_profile(args.model)
+    os.environ["MEGAGEMM_DECODE_TIMING"] = "1"
+    os.environ["MEGAGEMM_DECODE_TIMING_PRINT"] = "0"
+
     from megagemm.engine import InferenceEngine
 
     dtype = _runtime_dtype(args.dtype)
@@ -133,6 +140,7 @@ def main() -> int:
     print(f"  max_new_tokens: {args.max_new_tokens}")
     print(f"  gpu:            {_gpu_snapshot()}")
     print(f"  decode_timing:  {os.environ.get('MEGAGEMM_DECODE_TIMING')}")
+    print(f"  profile:        {profile_environment}")
     if args.batch_size > 1 and args.repetition_penalty != 1.0:
         print("  note:           generate_batch() currently ignores repetition_penalty")
 
@@ -248,8 +256,11 @@ def main() -> int:
         "gemma4_flat_fused_qkv_layers",
         "gemma4_flat_fused_gateup_hits",
         "gemma4_flat_deepfusion_hits",
+        "gemma4_ple_conditioned_gelu_decode_hits",
+        "gemma4_cublaslt_gateup_decode_hits",
         "gemma4_dense_post_norm_chain_decode_hits",
         "gemma4_dense_next_attn_norm_decode_hits",
+        "gemma4_dense_attn_mlp_bridge_decode_hits",
     )
     runtime_counter_delta = {}
     for key in counter_keys:
@@ -259,7 +270,11 @@ def main() -> int:
             runtime_counter_delta[key] = after - before
     paged_before = runtime_before.get("paged_decode_runtime") or {}
     paged_after = runtime_after.get("paged_decode_runtime") or {}
-    for key in ("gqa2_direct_hits", "generic_direct_hits"):
+    for key in (
+        "gqa2_direct_hits",
+        "generic_direct_hits",
+        "grouped_segmented_hits",
+    ):
         before = paged_before.get(key, 0)
         after = paged_after.get(key, 0)
         if isinstance(before, (int, float)) and isinstance(after, (int, float)):
@@ -291,6 +306,7 @@ def main() -> int:
 
     payload = {
         "args": vars(args),
+        "profile_environment": profile_environment,
         "gpu": _gpu_snapshot(),
         "prompt_tokens_actual_total": prompt_tokens_actual,
         "scheduler_stats": scheduler_stats,

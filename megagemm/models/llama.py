@@ -11123,11 +11123,14 @@ class MegaGemmLlama(nn.Module):
         for layer in self.layers:
             attention = getattr(layer, "self_attn", None)
             if attention is not None:
+                sliding_window = int(
+                    getattr(attention, "sliding_window", 0) or 0
+                )
                 attention._gemma4_e2b_l4_sliding_prefill_enabled = bool(
-                    e2b_l4_sliding_prefill
+                    e2b_l4_sliding_prefill and sliding_window > 0
                 )
                 attention._gemma4_e2b_l4_full_prefill_expand_enabled = bool(
-                    e2b_l4_full_prefill_expand
+                    e2b_l4_full_prefill_expand and sliding_window <= 0
                 )
         explicit_rmsnorm = os.environ.get(
             "MEGAGEMM_DISABLE_CUDA_RMSNORM", ""

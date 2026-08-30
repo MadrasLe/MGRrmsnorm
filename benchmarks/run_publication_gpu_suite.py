@@ -823,6 +823,18 @@ def audit_gemma4_dense_fast_path(path: Path, profile: str) -> dict:
         e2b_l4_long_stats,
         "gemma4_e2b_l4_full_prefill_expand_hits",
     )
+    e2b_l4_full_prefill_expand_enabled_layers = sorted(
+        {
+            int(
+                stats.get(
+                    "gemma4_e2b_l4_full_prefill_expand_enabled_layers",
+                    0,
+                )
+                or 0
+            )
+            for stats in e2b_l4_long_stats
+        }
+    )
     e2b_l4_full_prefill_expand_errors = sorted(
         {
             str(stats.get("gemma4_e2b_l4_full_prefill_expand_error") or "")
@@ -840,6 +852,17 @@ def audit_gemma4_dense_fast_path(path: Path, profile: str) -> dict:
             errors.append(
                 "E2B L4 BF16 long full-H512 expanded implicit-causal prefill "
                 "path was never exercised"
+            )
+        expected_full_layers = int(
+            requirement.get("topology", {}).get("full_attention_layers", 0)
+            or 0
+        )
+        if e2b_l4_full_prefill_expand_enabled_layers != [expected_full_layers]:
+            errors.append(
+                "E2B L4 BF16 long full-H512 expanded implicit-causal prefill "
+                "path is not scoped to the expected full-attention layers: "
+                f"{e2b_l4_full_prefill_expand_enabled_layers!r} != "
+                f"[{expected_full_layers}]"
             )
         if e2b_l4_full_prefill_expand_errors:
             errors.append(
@@ -962,6 +985,9 @@ def audit_gemma4_dense_fast_path(path: Path, profile: str) -> dict:
                 e2b_l4_full_prefill_expand_enabled
             ),
             "e2b_l4_full_prefill_expand_hits": e2b_l4_full_prefill_expand_hits,
+            "e2b_l4_full_prefill_expand_enabled_layers": (
+                e2b_l4_full_prefill_expand_enabled_layers
+            ),
             "e2b_l4_full_prefill_expand_errors": (
                 e2b_l4_full_prefill_expand_errors
             ),

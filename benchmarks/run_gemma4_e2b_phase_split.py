@@ -254,6 +254,12 @@ def summarize_samples(
                 (int(item.get("enabled_layers", 0)) for item in full_prefill_samples),
                 default=0,
             ),
+            "enabled_layers_values": sorted(
+                {
+                    int(item.get("enabled_layers", 0))
+                    for item in full_prefill_samples
+                }
+            ),
             "hits_max": max(
                 (int(item.get("hits", 0)) for item in full_prefill_samples),
                 default=0,
@@ -368,6 +374,12 @@ def measure(args: argparse.Namespace) -> dict[str, Any]:
             raise RuntimeError(
                 "promoted E2B/L4 full-H512 expanded implicit-causal prefill "
                 "path recorded zero hits"
+            )
+        if full_prefill_audit["enabled_layers_values"] != [7]:
+            raise RuntimeError(
+                "promoted E2B/L4 full-H512 expanded implicit-causal prefill "
+                "path must be scoped to exactly 7 full-attention layers; "
+                f"observed {full_prefill_audit['enabled_layers_values']}"
             )
         if full_prefill_audit["errors"]:
             raise RuntimeError(

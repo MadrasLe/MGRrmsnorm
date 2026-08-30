@@ -433,6 +433,7 @@ def test_e2b_audit_requires_promoted_l4_long_sliding_prefill_hits(tmp_path):
             "gemma4_e2b_l4_sliding_prefill_enabled": True,
             "gemma4_e2b_l4_sliding_prefill_hits": 224,
             "gemma4_e2b_l4_full_prefill_expand_enabled": True,
+            "gemma4_e2b_l4_full_prefill_expand_enabled_layers": 7,
             "gemma4_e2b_l4_full_prefill_expand_hits": 56,
             "gemma4_e2b_l4_full_prefill_expand_error": "",
             "runtime_policy": {
@@ -476,6 +477,9 @@ def test_e2b_audit_requires_promoted_l4_long_sliding_prefill_hits(tmp_path):
     assert report["required"]["e2b_l4_full_prefill_expand_applicable"] is True
     assert report["required"]["e2b_l4_full_prefill_expand_enabled"] is True
     assert report["required"]["e2b_l4_full_prefill_expand_hits"] == 56
+    assert report["required"][
+        "e2b_l4_full_prefill_expand_enabled_layers"
+    ] == [7]
     assert report["required"]["e2b_l4_full_prefill_expand_errors"] == []
     assert report["performance_gate"]["floors"][
         "long_context/b8/p2048"

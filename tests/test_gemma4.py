@@ -1455,10 +1455,50 @@ def test_gemma4_tiny_prefill_uses_heterogeneous_kv_and_shared_cache():
     assert model._gemma4_implicit_causal_prefill_batches == 0
 
     decode_ids = torch.tensor([[9], [10]], dtype=torch.long)
-    decode_positions = block_manager.get_seq_lens_tensor([0, 1]).long().unsqueeze(1)
-    decode_logits = model.decode_step(decode_ids, decode_positions, block_manager, [0, 1])
+    decode_positions = (
+        block_manager.get_seq_lens_tensor([0, 1]).long().unsqueeze(1)
+    )
+    decode_logits = model.decode_step(
+        decode_ids,
+        decode_positions,
+        block_manager,
+        [0, 1],
+    )
     assert decode_logits.shape == (2, 1, config.vocab_size)
 
+
+def test_gemma4_prefill_runtime_flags_are_scoped_by_attention_type():
+    config = LlamaConfig.from_dict(_tiny_gemma4_config_dict())
+    model = MegaGemmLlama(config).eval()
+
+    promoted_fields = {
+        "gemma4_e2b_l4_sliding_prefill",
+        "gemma4_e2b_l4_full_prefill_expand",
+    }
+
+    def promoted_policy(_model, _env_name, policy_field, default=False):
+        return policy_field in promoted_fields
+
+    with mock.patch(
+        "megagemm.models.llama.policy_bool",
+        side_effect=promoted_policy,
+    ):
+        model._refresh_gemma4_runtime_buffers(
+            device="cpu",
+            dtype=torch.float32,
+        )
+
+    sliding_flags = [
+        layer.self_attn._gemma4_e2b_l4_sliding_prefill_enabled
+        for layer in model.layers
+    ]
+    full_flags = [
+        layer.self_attn._gemma4_e2b_l4_full_prefill_expand_enabled
+        for layer in model.layers
+    ]
+
+    assert sliding_flags == [True, False, True, False]
+    assert full_flags == [False, True, False, True]
 
 def test_gemma4_uniform_batch_vectorizes_kv_and_projects_only_last_tokens():
     torch.manual_seed(0)
