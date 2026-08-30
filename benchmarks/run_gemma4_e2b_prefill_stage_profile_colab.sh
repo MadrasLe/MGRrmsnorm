@@ -24,20 +24,24 @@ import sentencepiece
 import tqdm
 import transformers
 import triton
+
+assert transformers.__version__ == "5.14.1", transformers.__version__
 PY
 then
   python -m pip install -q \
-    huggingface_hub safetensors transformers sentencepiece psutil tqdm
+    huggingface_hub safetensors "transformers==5.14.1" sentencepiece psutil tqdm
 fi
 
 python - <<'PY'
 import megagemm
 import torch
+import transformers
 import triton
 
 print("Torch:", torch.__version__, "CUDA:", torch.version.cuda)
 print("MegaGemm:", megagemm.__file__)
 print("Triton:", triton.__version__)
+print("Transformers:", transformers.__version__)
 assert torch.cuda.is_available(), "CUDA indisponível"
 assert "/content/drive/MyDrive/mg/MGRrmsnorm/" in megagemm.__file__
 PY
