@@ -2647,13 +2647,15 @@ class InferenceEngine:
         from torch.profiler import profile, ProfilerActivity
         prompts = list(prompt) if isinstance(prompt, (list, tuple)) else None
 
-        with profile(
-            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-            record_shapes=False,
-            with_stack=False,
-            profile_memory=False,
-        ) as prof:
-            if prompts is None:
+        profiler_kwargs = {
+            "activities": [ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            "record_shapes": False,
+            "with_stack": False,
+            "profile_memory": False,
+        }
+        profiler_scope = "full_generation"
+        if prompts is None:
+            with profile(**profiler_kwargs) as prof:
                 if ignore_eos:
                     self._generate_single(
                         str(prompt),
@@ -2676,7 +2678,24 @@ class InferenceEngine:
                         repetition_penalty=repetition_penalty,
                         xai=False,
                     )
-            else:
+        else:
+            # Start only after the final request's prefill callback.  This
+            # prevents long-context prefill GEMMs from contaminating a decode
+            # profile while preserving the normal Scheduler decode route.
+            prof = profile(**profiler_kwargs)
+            prefill_callbacks = 0
+            profiler_started = False
+
+            def _start_after_batched_prefill(_request, _pending_logits):
+                nonlocal prefill_callbacks, profiler_started
+                prefill_callbacks += 1
+                if not profiler_started and prefill_callbacks >= len(prompts):
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    prof.start()
+                    profiler_started = True
+
+            try:
                 self.generate_batch(
                     prompts,
                     max_new_tokens=max_new_tokens,
@@ -2684,8 +2703,14 @@ class InferenceEngine:
                     top_k=top_k,
                     top_p=top_p,
                     ignore_eos=ignore_eos,
+                    prefill_capture_hook=_start_after_batched_prefill,
                     decode_outputs=False,
                 )
+            finally:
+                if not profiler_started:
+                    prof.start()
+                prof.stop()
+            profiler_scope = "decode_after_batched_prefill"
 
         rows = prof.key_averages()
 
@@ -2786,6 +2811,7 @@ class InferenceEngine:
             "cuda_swiglu_ms": _sum_cuda_ms(["_mg_swiglu_fwd_kernel", "MegaGemmFunction"]),
             "launch_calls": float(launch_calls),
             "cuda_total_self_ms": sum(item["cuda_ms"] for item in cuda_rows),
+            "profile_scope": profiler_scope,
         }
         summary["cuda_top_ops"] = cuda_rows[:20]
         summary["batch_size"] = float(len(prompts) if prompts is not None else 1)
@@ -2811,6 +2837,7 @@ class InferenceEngine:
             + " | ".join(
                 [
                     f"batch={int(summary['batch_size'])}",
+                    f"scope={summary['profile_scope']}",
                     f"cpu_launch={summary['cpu_launch_ms']:.1f}ms",
                     f"cpu_alloc={summary['cpu_alloc_ms']:.1f}ms",
                     f"cpu_view={summary['cpu_view_ms']:.1f}ms",

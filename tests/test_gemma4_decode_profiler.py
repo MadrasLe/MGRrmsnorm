@@ -4,6 +4,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 PROFILER = ROOT / "benchmarks" / "profile_gemma4_decode.py"
+ENGINE = ROOT / "megagemm" / "engine" / "engine.py"
 
 
 def _load_profiler():
@@ -31,6 +32,11 @@ def test_decode_profiler_recreates_promoted_profile_and_reports_current_paths():
     assert "gemma4_dense_attn_mlp_bridge_decode_hits" in source
     assert '"grouped_segmented_hits"' in source
     assert '"attn_mlp_bridge"' in source
+
+    engine_source = ENGINE.read_text(encoding="utf-8")
+    assert "_start_after_batched_prefill" in engine_source
+    assert "decode_after_batched_prefill" in engine_source
+    assert "prefill_capture_hook=_start_after_batched_prefill" in engine_source
 
 
 def test_runtime_counter_delta_includes_production_dense_and_attention_paths():
