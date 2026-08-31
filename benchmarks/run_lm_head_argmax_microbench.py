@@ -81,6 +81,14 @@ def main() -> int:
     parser.add_argument("--repeats", type=int, default=7)
     parser.add_argument("--seed", type=int, default=31)
     parser.add_argument("--eager", action="store_true")
+    parser.add_argument(
+        "--cases",
+        default="base,fused,fused-rmsnorm",
+        help=(
+            "comma-separated measured paths: base, fused, fused-rmsnorm. "
+            "The reference path is still evaluated once for correctness."
+        ),
+    )
     parser.add_argument("--out-json", default="")
     args = parser.parse_args()
 
@@ -144,11 +152,21 @@ def main() -> int:
 
     reference = base_call().clone()
     torch.cuda.synchronize()
-    cases = [
-        ("base_norm_linear_argmax", base_call),
-        ("fused_lm_head_argmax", fused_call),
-        ("fused_rmsnorm_lm_head_argmax", fused_rmsnorm_call),
-    ]
+    available_cases = {
+        "base": ("base_norm_linear_argmax", base_call),
+        "fused": ("fused_lm_head_argmax", fused_call),
+        "fused-rmsnorm": ("fused_rmsnorm_lm_head_argmax", fused_rmsnorm_call),
+    }
+    requested_cases = [item.strip() for item in args.cases.split(",") if item.strip()]
+    unknown_cases = sorted(set(requested_cases) - set(available_cases))
+    if unknown_cases:
+        parser.error(
+            f"unknown --cases value(s): {', '.join(unknown_cases)}; "
+            f"choose from {', '.join(available_cases)}"
+        )
+    if not requested_cases:
+        parser.error("--cases must select at least one path")
+    cases = [available_cases[name] for name in requested_cases]
     measure = _measure_eager_us if args.eager else _measure_graph_us
     rows = []
     for name, fn in cases:
