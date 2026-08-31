@@ -305,6 +305,7 @@ def main() -> int:
         top_p=args.top_p,
         repetition_penalty=args.repetition_penalty,
         ignore_eos=args.ignore_eos,
+        record_shapes=True,
     )
     _sync(args.device)
 
@@ -404,6 +405,14 @@ def main() -> int:
                 print(f"  {key:<28} {int(value)}")
             else:
                 print(f"  {key:<28} {float(value):.2f}{suffix}")
+
+    print("\nCUDA MM Shapes")
+    for index, row in enumerate(summary.get("cuda_mm_shapes") or [], start=1):
+        print(
+            f"  {index:02d}. {row['cuda_ms']:.3f} ms "
+            f"calls={row['calls']} op={row['name']} "
+            f"inputs={row['input_shapes']}"
+        )
 
     payload = {
         "args": vars(args),

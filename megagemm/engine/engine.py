@@ -2639,6 +2639,7 @@ class InferenceEngine:
         top_p: float = 1.0,
         repetition_penalty: float = 1.0,
         ignore_eos: bool = False,
+        record_shapes: bool = False,
     ) -> Dict[str, Any]:
         """
         Profile one generation pass and summarize decode bottlenecks.
@@ -2649,7 +2650,7 @@ class InferenceEngine:
 
         profiler_kwargs = {
             "activities": [ProfilerActivity.CPU, ProfilerActivity.CUDA],
-            "record_shapes": False,
+            "record_shapes": bool(record_shapes),
             "with_stack": False,
             "profile_memory": False,
         }
@@ -2752,6 +2753,42 @@ class InferenceEngine:
                 )
         cuda_rows.sort(key=lambda item: item["cuda_ms"], reverse=True)
 
+        def _jsonable_shapes(value):
+            if isinstance(value, (list, tuple)):
+                return [_jsonable_shapes(item) for item in value]
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                return value
+            return str(value)
+
+        mm_shape_rows = []
+        if record_shapes:
+            for row in prof.key_averages(group_by_input_shape=True):
+                if str(row.key) not in {"aten::mm", "aten::addmm"}:
+                    continue
+                cuda_us = float(
+                    getattr(
+                        row,
+                        "self_cuda_time_total",
+                        getattr(row, "self_device_time_total", 0.0),
+                    )
+                )
+                if cuda_us <= 0.0:
+                    continue
+                mm_shape_rows.append(
+                    {
+                        "name": str(row.key),
+                        "input_shapes": _jsonable_shapes(
+                            getattr(row, "input_shapes", [])
+                        ),
+                        "cuda_ms": cuda_us / 1000.0,
+                        "calls": int(row.count),
+                    }
+                )
+            mm_shape_rows.sort(
+                key=lambda item: item["cuda_ms"],
+                reverse=True,
+            )
+
         summary = {
             "cpu_launch_ms": _sum_cpu_ms(["cudaLaunchKernel", "cuLaunchKernelEx"]),
             "cpu_alloc_ms": _sum_cpu_ms(["aten::empty", "aten::empty_strided", "aten::empty_like"]),
@@ -2812,6 +2849,8 @@ class InferenceEngine:
             "launch_calls": float(launch_calls),
             "cuda_total_self_ms": sum(item["cuda_ms"] for item in cuda_rows),
             "profile_scope": profiler_scope,
+            "record_shapes": bool(record_shapes),
+            "cuda_mm_shapes": mm_shape_rows,
         }
         summary["cuda_top_ops"] = cuda_rows[:20]
         summary["batch_size"] = float(len(prompts) if prompts is not None else 1)
@@ -2865,6 +2904,12 @@ class InferenceEngine:
             print(
                 f"profile_cuda_top {idx:02d} "
                 f"{item['cuda_ms']:.3f}ms calls={item['calls']} name={item['name']}"
+            )
+        for idx, item in enumerate(summary["cuda_mm_shapes"][:20], start=1):
+            print(
+                f"profile_mm_shape {idx:02d} "
+                f"{item['cuda_ms']:.3f}ms calls={item['calls']} "
+                f"op={item['name']} inputs={item['input_shapes']}"
             )
         return summary
 
