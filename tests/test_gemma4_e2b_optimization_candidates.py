@@ -179,6 +179,8 @@ def test_e2b_candidate_gates_and_native_binding_are_present():
     assert "cublasLtMatmulAlgoGetHeuristic" in native
     assert "MEGAGEMM_GEMMA4_E2B_CUBLASLT_GATEUP_DECODE" in llama
     assert "MEGAGEMM_GEMMA4_DENSE_ATTN_MLP_BRIDGE_DECODE" in llama
+    assert "timing_events is None\n                and not lw.is_moe" not in llama
+    assert '"attn_mlp_bridge"' in llama
     assert "/content/drive/MyDrive/mg/MGRrmsnorm" in colab
     assert "git pull" not in colab
     assert "pip install" not in colab

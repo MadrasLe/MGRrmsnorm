@@ -17604,12 +17604,14 @@ class MegaGemmLlama(nn.Module):
                     )
                 self._gemma4_flat_fused_attn_moe_bridge_hits += 1
             elif (
-                timing_events is None
-                and not lw.is_moe
+                not lw.is_moe
                 and int(bsz) == 8
                 and self._gemma4_flat_dense_attn_mlp_bridge_enabled
                 and not self._gemma4_flat_dense_attn_mlp_bridge_runtime_disabled
             ):
+                dense_bridge_start_end = _timing_record_start(
+                    timing_events is not None
+                )
                 try:
                     hidden, bridge_dense_in = (
                         rmsnorm_triton_attn_residual_dense(
@@ -17643,6 +17645,11 @@ class MegaGemmLlama(nn.Module):
                         norm_offset,
                     )
                     hidden = residual.add_(attn_normed)
+                _timing_record_end(
+                    timing_events,
+                    "attn_mlp_bridge",
+                    dense_bridge_start_end,
+                )
             else:
                 attn_output_norm_start_end = _timing_record_start(
                     timing_events is not None
@@ -19384,6 +19391,7 @@ class MegaGemmLlama(nn.Module):
                     "attn_core_ms",
                     "attn_o_proj_ms",
                     "attn_output_norm_ms",
+                    "attn_mlp_bridge_ms",
                 )
                 attn_total = sum(summary.get(key, 0.0) for key in attn_keys)
                 if attn_total > 0.0:

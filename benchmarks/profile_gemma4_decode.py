@@ -22,6 +22,7 @@ import gc
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -83,6 +84,45 @@ def _print_group(summary: dict[str, float], title: str, keys: list[tuple[str, st
         print(f"  {label:<18} {value:8.2f} ms  ({_percent(value, total):5.1f}%)")
 
 
+def _runtime_counter_delta(
+    before: dict[str, Any],
+    after: dict[str, Any],
+) -> dict[str, int | float]:
+    counter_keys = (
+        "gemma4_flat_fused_gateup_hits",
+        "gemma4_flat_deepfusion_hits",
+        "gemma4_ple_conditioned_gelu_decode_hits",
+        "gemma4_cublaslt_gateup_decode_hits",
+        "gemma4_dense_post_norm_chain_decode_hits",
+        "gemma4_dense_next_attn_norm_decode_hits",
+        "gemma4_dense_attn_mlp_bridge_decode_hits",
+    )
+    delta: dict[str, int | float] = {}
+    for key in counter_keys:
+        before_value = before.get(key, 0)
+        after_value = after.get(key, 0)
+        if isinstance(before_value, (int, float)) and isinstance(
+            after_value,
+            (int, float),
+        ):
+            delta[key] = after_value - before_value
+    paged_before = before.get("paged_decode_runtime") or {}
+    paged_after = after.get("paged_decode_runtime") or {}
+    for key in (
+        "gqa2_direct_hits",
+        "generic_direct_hits",
+        "grouped_segmented_hits",
+    ):
+        before_value = paged_before.get(key, 0)
+        after_value = paged_after.get(key, 0)
+        if isinstance(before_value, (int, float)) and isinstance(
+            after_value,
+            (int, float),
+        ):
+            delta[f"paged_decode_{key}"] = after_value - before_value
+    return delta
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Profile Gemma 4 decode on MegaGemm")
     parser.add_argument("--model", default="google/gemma-4-E2B-it")
@@ -127,6 +167,7 @@ def main() -> int:
     os.environ["MEGAGEMM_DECODE_TIMING_PRINT"] = "0"
 
     from megagemm.engine import InferenceEngine
+    import megagemm.models.llama as llama_runtime
 
     dtype = _runtime_dtype(args.dtype)
     max_batch_size = args.max_batch_size or args.batch_size
@@ -172,7 +213,10 @@ def main() -> int:
     print(f"  prompt_actual:  {prompt_tokens_actual} total tokens")
 
     runtime_stats_fn = getattr(engine.model, "decode_runtime_stats", None)
-    runtime_before = runtime_stats_fn() if callable(runtime_stats_fn) else {}
+
+    # Warmup must use the real production route.  Component timing allocates
+    # CUDA events and is enabled only for a separate pass below.
+    llama_runtime._DECODE_TIMING = False
 
     warmup_tokens = min(args.warmup_tokens, args.max_new_tokens)
     if warmup_tokens > 0:
@@ -187,7 +231,71 @@ def main() -> int:
         )
         _sync(args.device)
 
-    print("\nProfiling")
+    runtime_before_production = (
+        runtime_stats_fn() if callable(runtime_stats_fn) else {}
+    )
+    print("\nProduction probe (no profiler, no timing events)")
+    production_start = time.perf_counter()
+    engine.generate_batch(
+        prompts,
+        max_new_tokens=args.max_new_tokens,
+        temperature=args.temperature,
+        top_k=args.top_k,
+        top_p=args.top_p,
+        ignore_eos=args.ignore_eos,
+        decode_outputs=False,
+    )
+    _sync(args.device)
+    production_elapsed_s = time.perf_counter() - production_start
+    production_scheduler_stats = {}
+    scheduler = getattr(engine, "_last_scheduler", None)
+    if scheduler is not None:
+        production_scheduler_stats = scheduler.get_stats()
+    runtime_after_production = (
+        runtime_stats_fn() if callable(runtime_stats_fn) else {}
+    )
+    production_counter_delta = _runtime_counter_delta(
+        runtime_before_production,
+        runtime_after_production,
+    )
+    production_generated = int(
+        production_scheduler_stats.get("total_tokens")
+        or (args.batch_size * args.max_new_tokens)
+    )
+    production_probe = {
+        "elapsed_s": production_elapsed_s,
+        "generated_tokens": production_generated,
+        "output_tps": production_generated / production_elapsed_s,
+        "scheduler_stats": production_scheduler_stats,
+        "fast_path_counter_delta": production_counter_delta,
+    }
+    print(json.dumps(production_probe, indent=2))
+
+    print("\nInternal CUDA-event timing pass (production paths preserved)")
+    llama_runtime._DECODE_TIMING = True
+    engine.generate_batch(
+        prompts,
+        max_new_tokens=args.max_new_tokens,
+        temperature=args.temperature,
+        top_k=args.top_k,
+        top_p=args.top_p,
+        ignore_eos=args.ignore_eos,
+        decode_outputs=False,
+    )
+    _sync(args.device)
+    timing_scheduler_stats = {}
+    scheduler = getattr(engine, "_last_scheduler", None)
+    if scheduler is not None:
+        timing_scheduler_stats = scheduler.get_stats()
+    decode_timing_fn = getattr(engine.model, "get_last_decode_timing", None)
+    internal_timing = (
+        dict(decode_timing_fn() or {})
+        if callable(decode_timing_fn)
+        else {}
+    )
+
+    print("\nTorch profiling pass (timing events disabled)")
+    llama_runtime._DECODE_TIMING = False
     _empty_cache(args.device)
     summary = engine.profile_decode_breakdown(
         prompts,
@@ -200,14 +308,16 @@ def main() -> int:
     )
     _sync(args.device)
 
-    scheduler_stats = {}
+    profiler_scheduler_stats = {}
     scheduler = getattr(engine, "_last_scheduler", None)
     if scheduler is not None:
-        scheduler_stats = scheduler.get_stats()
+        profiler_scheduler_stats = scheduler.get_stats()
     runtime_after = runtime_stats_fn() if callable(runtime_stats_fn) else {}
 
     decode_total = float(summary.get("decode_total_ms", 0.0) or 0.0)
-    print(f"\nScheduler stats: {scheduler_stats}")
+    print(f"\nProduction scheduler stats: {production_scheduler_stats}")
+    print(f"Timing-pass scheduler stats: {timing_scheduler_stats}")
+    print(f"Profiler-pass scheduler stats: {profiler_scheduler_stats}")
     if decode_total > 0.0:
         _print_group(
             summary,
@@ -235,6 +345,7 @@ def main() -> int:
                 ("decode_attn_core_full_ms", "core_full"),
                 ("decode_attn_o_proj_ms", "o_proj"),
                 ("decode_attn_output_norm_ms", "output_norm"),
+                ("decode_attn_mlp_bridge_ms", "attn_mlp_bridge"),
             ],
             "decode_attn_ms",
         )
@@ -252,35 +363,25 @@ def main() -> int:
             "decode_mlp_ms",
         )
 
-    counter_keys = (
-        "gemma4_flat_fused_qkv_layers",
-        "gemma4_flat_fused_gateup_hits",
-        "gemma4_flat_deepfusion_hits",
-        "gemma4_ple_conditioned_gelu_decode_hits",
-        "gemma4_cublaslt_gateup_decode_hits",
-        "gemma4_dense_post_norm_chain_decode_hits",
-        "gemma4_dense_next_attn_norm_decode_hits",
-        "gemma4_dense_attn_mlp_bridge_decode_hits",
-    )
-    runtime_counter_delta = {}
-    for key in counter_keys:
-        before = runtime_before.get(key, 0)
-        after = runtime_after.get(key, 0)
-        if isinstance(before, (int, float)) and isinstance(after, (int, float)):
-            runtime_counter_delta[key] = after - before
-    paged_before = runtime_before.get("paged_decode_runtime") or {}
-    paged_after = runtime_after.get("paged_decode_runtime") or {}
-    for key in (
-        "gqa2_direct_hits",
-        "generic_direct_hits",
-        "grouped_segmented_hits",
-    ):
-        before = paged_before.get(key, 0)
-        after = paged_after.get(key, 0)
-        if isinstance(before, (int, float)) and isinstance(after, (int, float)):
-            runtime_counter_delta[f"paged_decode_{key}"] = after - before
     print("\nProduction fast-path counter deltas")
-    print(json.dumps(runtime_counter_delta, indent=2))
+    print(json.dumps(production_counter_delta, indent=2))
+    fast_path_state = {
+        key: runtime_after_production.get(key)
+        for key in (
+            "gemma4_flat_fused_qkv_layers",
+            "gemma4_dense_attn_mlp_bridge_decode_enabled",
+            "gemma4_dense_attn_mlp_bridge_runtime_disabled",
+            "gemma4_dense_attn_mlp_bridge_failure",
+            "gemma4_cublaslt_gateup_decode_enabled",
+            "gemma4_cublaslt_gateup_runtime_disabled",
+            "gemma4_cublaslt_gateup_failure",
+            "gemma4_ple_conditioned_gelu_decode_enabled",
+            "gemma4_ple_conditioned_gelu_runtime_disabled",
+            "gemma4_ple_conditioned_gelu_first_failure",
+        )
+    }
+    print("\nProduction fast-path state")
+    print(json.dumps(fast_path_state, indent=2))
 
     print("\nTorch Profiler Buckets")
     for key in (
@@ -309,10 +410,14 @@ def main() -> int:
         "profile_environment": profile_environment,
         "gpu": _gpu_snapshot(),
         "prompt_tokens_actual_total": prompt_tokens_actual,
-        "scheduler_stats": scheduler_stats,
-        "decode_runtime_before": runtime_before,
+        "production_probe": production_probe,
+        "timing_scheduler_stats": timing_scheduler_stats,
+        "profiler_scheduler_stats": profiler_scheduler_stats,
+        "internal_timing": internal_timing,
+        "decode_runtime_before": runtime_before_production,
         "decode_runtime_after": runtime_after,
-        "decode_runtime_counter_delta": runtime_counter_delta,
+        "production_fast_path_state": fast_path_state,
+        "decode_runtime_counter_delta": production_counter_delta,
         "summary": summary,
     }
     out_path = Path(args.out)
